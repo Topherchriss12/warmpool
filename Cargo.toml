@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["warmpool", "warmpool-macros"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/YOUR_USERNAME/warmpool"
+description = "Fast Postgres integration tests via fingerprinted, template-cloned databases."
+readme = "../README.md"
+keywords = ["postgres", "sqlx", "testing", "integration-test", "database", "templates", "developer-tools"]
+categories = ["database", "development-tools::testing"]

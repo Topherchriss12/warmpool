@@ -1,0 +1,39 @@
+[package]
+name = "warmpool"
+description = "Fast Postgres integration tests via fingerprinted, template-cloned databases."
+readme = "README.md"
+keywords = ["postgres", "sqlx", "testing", "integration-test", "database", "templates", "developer-tools"]
+categories = ["database", "development-tools::testing"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-native-tls",
+    "postgres",
+    "migrate",
+    "uuid",
+] }
+tokio = { version = "1", features = ["sync"] }
+thiserror = "2"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+futures-util = "0.3"
+warmpool-macros = { path = "../warmpool-macros", version = "0.1.0", optional = true }
+
+[features]
+default = []
+macros = ["dep:warmpool-macros"]
+
+[dev-dependencies]
+testcontainers = "0.15"
+testcontainers-modules = { version = "0.3", features = ["postgres"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[[example]]
+name = "builder"
+path = "examples/builder.rs"
+required-features = []

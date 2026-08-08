@@ -1,0 +1,15 @@
+[package]
+name = "warmpool-macros"
+description = "Proc-macro companion for warmpool. Not meant to be depended on directly."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"

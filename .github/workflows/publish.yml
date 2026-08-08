@@ -1,0 +1,70 @@
+name: Publish crates
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build output
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run unit and doc tests
+        run: cargo test --workspace
+
+      # testcontainers starts its own Postgres container.
+      - name: Run integration tests (Postgres via testcontainers)
+        run: cargo test --workspace -- --ignored
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish warmpool-macros
+        run: cargo publish --manifest-path warmpool-macros/Cargo.toml
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      - name: Publish warmpool
+        # Depends on the warmpool-macros version just published above;
+        # crates.io's index can take a few seconds to catch up, so we retry
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if cargo publish --manifest-path warmpool/Cargo.toml; then
+              exit 0
+            fi
+            echo "attempt $attempt/5 failed — retrying in 15s in case the index hasn't caught up"
+            sleep 15
+          done
+          exit 1
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
