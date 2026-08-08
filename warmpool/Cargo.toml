@@ -2,7 +2,7 @@
 name = "warmpool"
 description = "Fast Postgres integration tests via fingerprinted, template-cloned databases."
 readme = "README.md"
-keywords = ["postgres", "sqlx", "testing", "integration-test", "database", "templates", "developer-tools"]
+keywords = ["postgres-database", "sqlx", "integration-testing", "templates", "developer-tools"]
 categories = ["database", "development-tools::testing"]
 version.workspace = true
 edition.workspace = true
