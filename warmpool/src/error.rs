@@ -3,9 +3,10 @@
 /// (names, versions, descriptions) to act on without re deriving it from a
 /// generic `sqlx::Error`.
 /// The `source` field of each variant is the underlying `sqlx::Error` that caused
-/// the failure, which can be downcast to `sqlx::error::DatabaseError` 
+/// the failure, which can be downcast to `sqlx::error::DatabaseError`
 /// when you need to inspect the Postgres error code or message.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("failed to connect to postgres for maintenance operations")]
     MaintenanceConnect(#[source] sqlx::Error),
@@ -52,9 +53,7 @@ pub enum Error {
         source: sqlx::Error,
     },
 
-    #[error(
-        "migration {version} (\"{description}\") failed while building template `{template}`"
-    )]
+    #[error("migration {version} (\"{description}\") failed while building template `{template}`")]
     MigrationFailed {
         version: i64,
         description: String,
@@ -91,6 +90,23 @@ pub enum Error {
         #[source]
         source: sqlx::Error,
     },
+
+    /// Fired from `build_or_reuse_template()`, on the same
+    /// maintenance connection already opened to check for / build the
+    /// template, before the advisory lock is taken. Cached for the
+    /// lifetime of the `TemplatePool` afterward, so this only fires (if it
+    /// fires at all) on the first `create_test_database()` call.
+    #[error("failed to read the connected server's `server_version_num`")]
+    ServerVersionCheck(#[source] sqlx::Error),
+
+    /// Postgres returned `server_version_num` as a plain
+    /// integer string in every version that's ever shipped it, so seeing
+    /// this in practice would mean something unusual is answering on the
+    /// other end of the connection, not a normal server version edge case.
+    /// further investigation is warranted if you see this error, but it should be
+    /// extremely rare in practice.
+    #[error("server returned an unparseable `server_version_num`: `{raw}`")]
+    ServerVersionParse { raw: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

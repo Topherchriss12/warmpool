@@ -55,7 +55,10 @@ mod tests {
     #[test]
     fn fingerprint_is_deterministic() {
         let migrations: Vec<Migration> = Vec::new();
-        assert_eq!(fingerprint(&migrations, None), fingerprint(&migrations, None));
+        assert_eq!(
+            fingerprint(&migrations, None),
+            fingerprint(&migrations, None)
+        );
     }
 
     #[test]

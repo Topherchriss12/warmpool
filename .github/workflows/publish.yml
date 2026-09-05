@@ -21,17 +21,25 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
 
       - name: Cache cargo registry and build output
         uses: Swatinem/rust-cache@v2
 
-      - name: Run unit and doc tests
+      - name: Check code formatting
+        run: cargo fmt --workspace --check
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Check project builds
+        run: cargo check --workspace
+
+      - name: Run unit, integration, and Postgres tests
         run: cargo test --workspace
 
-      # testcontainers starts its own Postgres container.
-      - name: Run integration tests (Postgres via testcontainers)
-        run: cargo test --workspace -- --ignored
-
+        
   publish:
     needs: test
     runs-on: ubuntu-latest

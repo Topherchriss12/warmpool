@@ -31,11 +31,11 @@
 //! let test_db = template.create_test_database().await?;
 //! let pool = test_db.pool();
 //!
-//! // ... run your test against `pool` ... 
+//! // ... run your test against `pool` ...
 //!
 //! test_db.drop_database().await?;
 //! # Ok(())
-//! // Encapsulate this bit of boilerplate in a function 
+//! // Encapsulate this bit of boilerplate in a function
 //! // or use the `#[warm_test]` macro below
 //! # }
 //! ```
@@ -52,16 +52,24 @@
 //!
 //! The macro reads `DATABASE_URL` for connection info by default; override
 //! with `#[warm_test(database_url_env = "TEST_DATABASE_URL")]`.
-//! The migrations path defaults to `./migrations` relative to the crate root; override 
+//! The migrations path defaults to `./migrations` relative to the crate root; override
 //! with `#[warm_test(migrations = "./my_migrations")]`.
+//!
+//! Every clone is created with `STRATEGY = WAL_LOG` by default as of 0.1.1
+//! (falls back automatically on Postgres < 15). Override via
+//! [`TemplatePoolBuilder::clone_strategy`], or via
+//! `#[warm_test(clone_strategy = "file_copy")]`. See the README's "Clone
+//! strategy" section for why `WAL_LOG` is the default.
 
 mod error;
 mod fingerprint;
 mod pool;
+mod strategy;
 
 pub use error::{Error, Result};
 pub use fingerprint::{fingerprint, lock_key_from_fingerprint};
 pub use pool::{TemplatePool, TemplatePoolBuilder, TestDatabase};
+pub use strategy::CloneStrategy;
 
 #[cfg(feature = "macros")]
 pub use warmpool_macros::warm_test;
