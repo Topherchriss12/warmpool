@@ -28,10 +28,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Check code formatting
-        run: cargo fmt --workspace --check
+        run: cargo fmt --all -- --check
 
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Check project builds
         run: cargo check --workspace
