@@ -1,5 +1,10 @@
 # warmpool
 
+[![CI](https://github.com/Topherchriss12/warmpool/actions/workflows/ci.yml/badge.svg)](https://github.com/Topherchriss12/warmpool/actions/workflows/ci.yml)
+[![Coverage](https://codecov.io/gh/Topherchriss12/warmpool/branch/main/graph/badge.svg)](https://codecov.io/gh/Topherchriss12/warmpool)
+[![crates.io](https://img.shields.io/crates/v/warmpool.svg)](https://crates.io/crates/warmpool)
+[![docs.rs](https://img.shields.io/docsrs/warmpool)](https://docs.rs/warmpool)
+
 Fast, isolated Postgres integration tests built on fingerprinted template databases.
 
 warmpool helps you keep Postgres backed integration tests fast and reliable without rebuilding the same schema from scratch on every run. It creates a template database once for a given migration set, then clones that template for each test case. Because Postgres can clone a template database efficiently, the expensive migration step is entirley avoided.
@@ -150,19 +155,22 @@ DROP DATABASE IF EXISTS warmpool_tmpl_<fingerprint>;
 
 ## Prior art
 
-[`sqlx-pg-test-template`](https://crates.io/crates/sqlx-pg-test-template) solves a related problem for Postgres integration tests, but its workflow is different. It expects you to build and maintain a template database outside of the test runtime, typically by running `sqlx database create` and `sqlx migrate run` whenever migrations change.
+There is an existing crate [`sqlx-pg-test-template`](https://crates.io/crates/sqlx-pg-test-template). It also uses Postgres template databases to speed up integration tests, but the approach is fundamentally different:
 
-warmpool’s template invalidation is automatic and built in. The template database name is derived from a fingerprint of the migration set, so schema changes automatically produce a new template name. That means warmpool can safely reuse existing templates when the migration set is unchanged, without requiring a separate manual rebuild step.
+- It requires you to create and maintain the template database *outside* the test run (usually via `sqlx database create` + `sqlx migrate run`).
+- Template invalidation is manual. When migrations change you must rebuild the template yourself.
+- There is no automatic fingerprinting or self-invalidation.
 
-warmpool also improves the runtime path because it uses Postgres native template cloning directly for every test database, rather than depending on an externally managed template creation process.
+warmpool takes a different path. It derives the template name from a deterministic fingerprint of the migration set (version + description + checksum). As a result:
 
-## Why use warmpool ?
-
-- no separate "build template" step to remember,
-- no manual invalidation when the migration set changes,
-- no risk of stale templates being reused silently,
-- predictable clone latency — `STRATEGY = WAL_LOG` pinned explicitly rather than left to an undocumented internal heuristic, with automatic, silent fallback on Postgres < 15,
-- and no external workflow required to keep test templates current.
+- The cloned template persists across test runs.
+- Cloned template is always up to date with the current migrations by structure.
+- Template creation and invalidation are automatic.
+- Schema changes naturally produce a new template name.
+- Existing templates are safely reused when the migrations have not changed.
+- No external setup step or rebuild script is required.
+- Predictable and  clone strategy.
+- The `#[warm_test]` macro requires no boilerplate or imports, it handles template creation, cloning, and cleanup automatically.
 
 ## License
 

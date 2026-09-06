@@ -1,5 +1,10 @@
 # warmpool
 
+[![CI](https://github.com/Topherchriss12/warmpool/actions/workflows/ci.yml/badge.svg)](https://github.com/Topherchriss12/warmpool/actions/workflows/ci.yml)
+[![Coverage](https://codecov.io/gh/Topherchriss12/warmpool/branch/main/graph/badge.svg)](https://codecov.io/gh/Topherchriss12/warmpool)
+[![crates.io](https://img.shields.io/crates/v/warmpool.svg)](https://crates.io/crates/warmpool)
+[![docs.rs](https://img.shields.io/docsrs/warmpool)](https://docs.rs/warmpool)
+
 Fast, isolated Postgres integration tests built on fingerprinted template databases.
 
 warmpool helps you keep Postgres backed integration tests fast and reliable without rebuilding the same schema from scratch on every run. It creates a template database once for a given migration set, then clones that template for each test case. Because Postgres can clone a template database efficiently, the expensive migration step is entirley avoided.
@@ -68,9 +73,9 @@ Postgres 15 added a choice of two strategies for `CREATE DATABASE ... TEMPLATE`:
 - **`FILE_COPY`** — forces a checkpoint, then copies the template's on-disk files. This is the only strategy that existed before Postgres 15, and it's what template cloning always did on older servers.
 - **`WAL_LOG`** — copies by replaying page changes through WAL instead of a full file copy, without forcing a checkpoint first.
 
-When you don't specify a strategy, PostgreSQL applies its server side default behavior. That behavior may vary between PostgreSQL versions and environments. On a disk backed instance, `FILE_COPY` can occasionally stall for hundreds of milliseconds even on a small template, while `WAL_LOG` is consistently fast. Prior to 0.1.1+, warmpool never specified a strategy and simply took whatever Postgres decided. As of 0.1.1, warmpool defaults to explicitly requesting `STRATEGY = WAL_LOG` on every clone. Environments that need predictable behavior should choose a strategy explicitly. 
+When you don't specify a strategy, PostgreSQL applies its server-side default behavior. That behavior may vary between PostgreSQL versions and environments. On a disk backed instance, `FILE_COPY` can occasionally stall for hundreds of milliseconds even on a small template, while `WAL_LOG` is consistently fast. Prior to 0.1.1, warmpool never specified a strategy and simply took whatever Postgres decided. As of 0.1.1, warmpool defaults to explicitly requesting `STRATEGY = WAL_LOG` on every clone. Environments that need predictable behavior should choose a strategy explicitly. 
 
-**Why:** for template sizes typical of an integration test schema (low tens of MB), `WAL_LOG` is both faster on average and the part that matters more for CI is more consistent. Benchmarked on this
+**Why:** for template sizes typical of an integration test schema (low tens of MB), `WAL_LOG` is both faster on average and the part that matters more for CI dramatically more consistent. Benchmarked on this
 crate's own test schema (a handful of tables, indexes, and a couple hundred seeded rows, ~8MB as a template) over 15 sequential clones on a single persistent connection, isolating the clone operation itself from connection/process overhead:
 
 | Storage         | Strategy    | avg      | min     | max            |
@@ -84,7 +89,7 @@ On real disk the common case for most CI runners, which don't give you control o
 schema size and everything to do with whatever else is touching the disk at that moment. `WAL_LOG` doesn't have that failure mode. On tmpfs the two converge on average (there's no real disk latency for `FILE_COPY` to be
 punished by), but `WAL_LOG`'s tail is still tighter.
 
-**These numbers are from one environment with one schema.** They're not a promise about yours. A benchmark script is included in this repo (`./scripts/bench_clone_strategy.sh`), run it against your own instance and
+**These numbers are from one environment with one schema.** They're not a promise about yours. A benchmark script is included in this repo (`scripts/bench_clone_strategy.sh`), run it against your own instance and
 your own template before assuming the defaults are doing the right thing for you on your infrastructure:
 
 ```sh
@@ -92,7 +97,8 @@ your own template before assuming the defaults are doing the right thing for you
 ```
 
 **How it decides:** `WAL_LOG` requires Postgres 15+. warmpool checks `server_version_num` once per `TemplatePool` the same maintenance connection already opened to build or verify the template pays this one extra query, cached for the process's lifetime and silently falls back to the pre 0.1.1 behavior (no `STRATEGY` clause, Postgres decides) on
-older servers. You never see an error from this; older servers just get the same behavior they always had.
+older servers. You never see an error from this; older servers just get
+the same behavior they always had.
 
 **Overriding it via builder API:**
 
@@ -149,20 +155,22 @@ DROP DATABASE IF EXISTS warmpool_tmpl_<fingerprint>;
 
 ## Prior art
 
-[`sqlx-pg-test-template`](https://crates.io/crates/sqlx-pg-test-template) solves a related problem for Postgres integration tests, but its workflow is different. It expects you to build and maintain a template database outside of the test runtime, typically by running `sqlx database create` and `sqlx migrate run` whenever migrations change.
+There is an existing crate [`sqlx-pg-test-template`](https://crates.io/crates/sqlx-pg-test-template). It also uses Postgres template databases to speed up integration tests, but the approach is fundamentally different:
 
-warmpool’s template invalidation is automatic and built in. The template database name is derived from a fingerprint of the migration set, so schema changes automatically produce a new template name. That means warmpool can safely reuse existing templates when the migration set is unchanged, without requiring a separate manual rebuild step.
+- It requires you to create and maintain the template database *outside* the test run (usually via `sqlx database create` + `sqlx migrate run`).
+- Template invalidation is manual. When migrations change you must rebuild the template yourself.
+- There is no automatic fingerprinting or self-invalidation.
 
-warmpool also improves the runtime path because it uses Postgres native template cloning directly for every test database, rather than depending on an externally managed template creation process.
+warmpool takes a different path. It derives the template name from a deterministic fingerprint of the migration set (version + description + checksum). As a result:
 
-## Why use warmpool ?
-
-- no separate "build template" step to remember,
-- no manual invalidation when the migration set changes,
-- no risk of stale templates being reused silently,
-- predictable clone latency — `STRATEGY = WAL_LOG` pinned explicitly, with automatic, silent fallback on Postgres < 15,
-- and no external workflow required to keep test templates current.
-
+- The cloned template persists across test runs.
+- Cloned template is always up to date with the current migrations by structure.
+- Template creation and invalidation are automatic.
+- Schema changes naturally produce a new template name.
+- Existing templates are safely reused when the migrations have not changed.
+- No external setup step or rebuild script is required.
+- Predictable and  clone strategy.
+- The `#[warm_test]` macro requires no boilerplate or imports, it handles template creation, cloning, and cleanup automatically.
 
 ## License
 
