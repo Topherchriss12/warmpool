@@ -172,6 +172,19 @@ warmpool takes a different path. It derives the template name from a determinist
 - Predictable and  clone strategy.
 - The `#[warm_test]` macro requires no boilerplate or imports, it handles template creation, cloning, and cleanup automatically.
 
+> More information is available at [unwrapui.onrender.com](https://unwrapui.onrender.com).
+
+In the terminal, run;
+
+```bash
+grep warmpool # Then click on the link `cat /var/www/blog/posts/introducing-warmpool`
+
+# Or type the cat command directly and run it.
+cat /var/www/blog/posts/introducing-warmpool
+```
+
+If you find warmpool useful, please consider starring the repo on GitHub. It helps others discover it and motivates me to keep improving it.
+
 ## License
 
 MIT
