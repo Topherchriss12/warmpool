@@ -69,6 +69,22 @@ pub enum Error {
         source: sqlx::Error,
     },
 
+    /// Fired from `create_test_database()`, immediately before the
+    /// `CREATE DATABASE ... TEMPLATE ...` statement, while clearing stray
+    /// connections from the template. If this fails, the clone attempt is aborted before it starts.
+    ///
+    /// However, this sweep does closes the window on a *pre-existing* stray connection,
+    /// a crashed process, a leftover `psql` session, anything that was already connected before this
+    /// call started, it cannot prevent a brand new connection from racing
+    /// in during the (very small) window between this sweep completing and
+    /// the `CREATE DATABASE` statement that follows it.
+    #[error("failed to clear stray connections from template `{name}` before cloning")]
+    TemplateConnectionSweep {
+        name: String,
+        #[source]
+        source: sqlx::Error,
+    },
+
     #[error("failed to create test database `{name}` from template `{template}`")]
     CreateTestDb {
         name: String,

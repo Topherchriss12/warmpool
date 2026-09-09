@@ -181,10 +181,27 @@ impl TemplatePool {
             .await
             .map_err(Error::MaintenanceConnect)?;
 
+        // Clear stray connections to the template before attempting the
+        // clone. Postgres refuses `CREATE DATABASE ... TEMPLATE` outright
+        // if *anyone* is connected to the source database,. By the
+        // time ensure_template() has returned here, the advisory lock for
+        // this template's fingerprint has necessarily been released,
+        // which means no legitimate build can still be holding a
+        // connection open (build_template_if_missing always closes its
+        // own connection before the lock is released). Anything found
+        // here is a genuine stray, not a build in progress. See
+        // `Error::TemplateConnectionSweep`.
+        terminate_other_backends(&mut maintenance, &template_info.name)
+            .await
+            .map_err(|source| Error::TemplateConnectionSweep {
+                name: template_info.name.clone(),
+                source,
+            })?;
+
         let db_name = format!("warmpool_test_{}", Uuid::new_v4().simple());
 
         // No-op on servers older than Postgres 15, which don't understand
-        // STRATEGY at all — see CloneStrategy::sql_clause.
+        // STRATEGY at all, see CloneStrategy::sql_clause.
         let strategy_clause = self
             .clone_strategy
             .sql_clause(template_info.server_version_num)
@@ -434,12 +451,20 @@ async fn purge_triggers(conn: &mut PgConnection, schema: &str) -> Result<()> {
     Ok(())
 }
 
-//- Pure SQL-building helpers-
+// SQL / connection management helpers
 //
-// Extracted so the exact statement text is unit-testable without a live
-// Postgres connection. None of these do any escaping beyond wrapping
-// identifiers in double quotes / literals in single quotes — see the test
-// module below for what that does and doesn't protect against.
+// These three `*_sql` functions are extracted so the exact statement text is
+// unit testable without a live Postgres connection. None of these do any
+// escaping beyond wrapping identifiers in double quotes / literals in
+// single quotes.
+//
+// `terminate_other_backends` is different in kind: it's an async
+// operation, not a pure string builder (its one dynamic value is a bound
+// parameter, `$1`, not string interpolated, so no escaping gap here to
+// document or test). Shared between the template sweep in
+// `create_test_database()` and the test database sweep in
+// `TestDatabase::drop_database()`: same query, two different reasons to
+// run it, two different `Error` variants at the two call sites.
 
 fn create_test_database_sql(db_name: &str, template_name: &str, strategy_clause: &str) -> String {
     format!(r#"CREATE DATABASE "{db_name}" WITH TEMPLATE "{template_name}"{strategy_clause};"#)
@@ -449,16 +474,16 @@ fn create_template_database_sql(template_name: &str) -> String {
     format!(r#"CREATE DATABASE "{template_name}";"#)
 }
 
-/// `schema` is interpolated directly into a single-quoted SQL string
+/// `schema` is interpolated directly into a single quoted SQL string
 /// literal (`WHERE nspname = '{schema}'`) rather than passed as a bound
-/// parameter — this DO block can't take one, since `EXECUTE format(...)`
+/// parameter, this DO block can't take one, since `EXECUTE format(...)`
 /// only parameterizes the identifiers it formats, not the literal driving
-/// the `WHERE` clause itself. In practice `schema` is a compile-time-ish
+/// the `WHERE` clause itself. In practice `schema` is a compile time-ish
 /// config value from [`TemplatePoolBuilder::purge_triggers_in`], not
-/// end-user input, so this hasn't been a practical problem — but it *is*
+/// end-user input, so this hasn't been a practical problem  but it is
 /// unescaped, and a schema name containing a `'` breaks out of the
-/// literal. See `purge_triggers_sql_does_not_escape_embedded_quotes`
-/// below, which documents this rather than pretending it isn't there.
+/// literal. `purge_triggers_sql_does_not_escape_embedded_quotes`
+/// documents this. We are not pretending it isn't there.
 fn purge_triggers_sql(schema: &str) -> String {
     format!(
         r#"
@@ -479,6 +504,24 @@ fn purge_triggers_sql(schema: &str) -> String {
         $$;
         "#
     )
+}
+
+/// Terminate every other backend connected to `datname`.
+async fn terminate_other_backends(
+    conn: &mut PgConnection,
+    datname: &str,
+) -> std::result::Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        SELECT pg_terminate_backend(pid)
+        FROM pg_stat_activity
+        WHERE datname = $1 AND pid <> pg_backend_pid()
+        "#,
+    )
+    .bind(datname)
+    .execute(conn)
+    .await?;
+    Ok(())
 }
 
 /// A cloned, migrated test database. Brcause Rust's `Drop` can't run async code,
@@ -513,20 +556,12 @@ impl TestDatabase {
 
         // Terminating lingering backends first and then issuing a plain
         // `DROP DATABASE` works on every supported version.
-        sqlx::query(
-            r#"
-            SELECT pg_terminate_backend(pid)
-            FROM pg_stat_activity
-            WHERE datname = $1 AND pid <> pg_backend_pid()
-            "#,
-        )
-        .bind(&self.name)
-        .execute(&mut maintenance)
-        .await
-        .map_err(|source| Error::DropTestDb {
-            name: self.name.clone(),
-            source,
-        })?;
+        terminate_other_backends(&mut maintenance, &self.name)
+            .await
+            .map_err(|source| Error::DropTestDb {
+                name: self.name.clone(),
+                source,
+            })?;
 
         maintenance
             .execute(format!(r#"DROP DATABASE IF EXISTS "{}";"#, self.name).as_str())
@@ -675,14 +710,13 @@ mod tests {
 
     #[tokio::test]
     async fn excluded_migration_is_not_retained_anywhere_on_the_built_pool() {
-        // TemplatePool has exactly one
-        // field that ever holds Migration values (`migrations`), and it
-        // only ever holds the already filtered set there is nowhere
-        // else in the struct an excluded migration's SQL could be hiding,
-        // ready to run against a freshly cloned test database later.
-        // create_test_database() confirms this: it never reads
-        // `self.migrations` at all, only `self.template_prefix` (via the
-        // cached template name) and `self.clone_strategy`.
+        // The previous test already asserts that the excluded migration is not in the
+        // stored set, but this one goes a step further and asserts that it is not
+        // retained anywhere else in the TemplatePool either (e.g. stashed for later
+        // application to test databases). This is important because the excluded
+        // migration is not applied to test databases, so if it were retained anywhere
+        // in the TemplatePool, it could be applied to test databases later, which
+        // would violate the contract of exclude_migration as of 0.1.2.
         let pool = TemplatePoolBuilder::new(dummy_connect_options())
             .migrations_from("./tests/fixtures/migrations")
             .exclude_migration(|m| m.description.contains("seed data"))

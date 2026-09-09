@@ -1,4 +1,4 @@
-use sqlx::PgPool;
+use sqlx::{Connection, PgPool};
 use std::time::Instant;
 use testcontainers::clients::Cli;
 use testcontainers_modules::postgres::Postgres;
@@ -289,7 +289,7 @@ async fn test_different_migrations_get_different_templates() {
 }
 
 /// Doesn't touch Postgres at all, so it runs under plain `cargo test`
-/// without `ignored` or Docker fast feedback that bad configuration
+/// without `--ignored` or Docker fast feedback that bad configuration
 /// surfaces as a typed, specific error instead of a panic somewhere deep in
 /// the pipeline.
 #[tokio::test]
@@ -307,13 +307,13 @@ async fn test_bad_migrations_path_returns_typed_error() {
     assert!(matches!(result, Err(warmpool::Error::MigratorLoad { .. })));
 }
 
-// 0.1.1
+// 0.1.x
 
 /// Functional correctness for each `CloneStrategy` variant: every one of
 /// them must actually produce a working, fully migrated database. This
 /// can't prove *which* strategy Postgres used internally (that isn't
 /// exposed anywhere queryable), only that specifying each one doesn't
-/// break cloning which is still worth locking in, a typo'd SQL
+/// break cloning which is still worth locking in, since a typo'd SQL
 /// fragment in `CloneStrategy::sql_clause` would otherwise only surface as
 /// a runtime `CreateTestDb` error the first time someone actually chose
 /// that variant.
@@ -392,8 +392,8 @@ async fn test_clone_strategy_auto_produces_a_working_database() {
         .expect("failed to build template pool");
 
     let db = template.create_test_database().await.expect(
-        "Auto (no STRATEGY clause) clone should succeed  this is exactly \
-                 pre-0.1.1 behavior, still must work unmodified",
+        "Auto (no STRATEGY clause) clone should succeed, this is exactly \
+                 pre-0.1.2 behavior, still must work unmodified",
     );
 
     let exists: bool = sqlx::query_scalar(
@@ -407,9 +407,9 @@ async fn test_clone_strategy_auto_produces_a_working_database() {
     db.drop_database().await.ok();
 }
 
-/// `TemplatePoolBuilder::clone_strategy` defaults to `WalLog` confirm
+/// `TemplatePoolBuilder::clone_strategy` defaults to `WalLog` -- confirm
 /// that not calling `.clone_strategy(...)` at all behaves identically to
-/// calling it with `CloneStrategy::WalLog` explicitly, like the default
+/// calling it with `CloneStrategy::WalLog` explicitly, i.e. the default
 /// really is wired through and isn't silently falling back to `Auto`.
 #[tokio::test]
 // #[ignore]
@@ -417,7 +417,7 @@ async fn test_default_clone_strategy_matches_explicit_wal_log() {
     let url = shared_postgres_url().await;
     let connect_options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
 
-    // No .clone_strategy(...) call
+    // No .clone_strategy(...) call at all.
     let default_template = TemplatePool::builder(connect_options.clone())
         .migrations_from("./tests/fixtures/migrations")
         .fingerprint_salt(format!("default_strategy_{}", uuid::Uuid::new_v4()))
@@ -506,16 +506,17 @@ async fn test_purge_triggers_in_removes_triggers_from_cloned_database_only() {
 /// across `cargo test` invocations...)". Within a single test binary we
 /// can't literally start a new process, but building a *second*,
 /// independent `TemplatePool` against the same migrations and the same
-/// fingerprint salt should euse the existing template rather than rebuilding one from scratch,
+/// fingerprint salt should reuse the existing template rather than rebuilding one from scratch,
 /// and the first clone from that second pool should be fast in the same way every clone after
 /// the first one from the first pool was.
 #[tokio::test]
+// #[ignore]
 async fn test_template_is_reused_across_separate_template_pool_instances() {
     let salt = format!("reuse_across_instances_{}", uuid::Uuid::new_v4());
     let url = shared_postgres_url().await;
     let connect_options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
 
-    // First TemplatePool pays the build cost.
+    // First TemplatePool: pays the full build cost.
     let pool_a = TemplatePool::builder(connect_options.clone())
         .migrations_from("./tests/fixtures/migrations")
         .fingerprint_salt(salt.clone())
@@ -529,7 +530,6 @@ async fn test_template_is_reused_across_separate_template_pool_instances() {
         .await
         .expect("failed to create test db from pool a");
     let elapsed_a = start_a.elapsed();
-    eprintln!("pool_a first clone: {:?}", elapsed_a);
     db_a.drop_database().await.ok();
 
     // Second, independent TemplatePool, same migrations + salt -> same
@@ -549,7 +549,6 @@ async fn test_template_is_reused_across_separate_template_pool_instances() {
         .await
         .expect("failed to create test db from pool b");
     let elapsed = start.elapsed();
-    eprintln!("pool_b first clone: {:?}", elapsed);
 
     let exists: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'users')",
@@ -591,31 +590,22 @@ async fn test_template_is_reused_across_separate_template_pool_instances() {
     db_b.drop_database().await.ok();
 }
 
-/// Documents a real, currently unfixed resilience gap not a
-/// desired feature: `create_test_database()` does not sweep the *template*
-/// database for lingering connections before cloning (unlike
-/// `TestDatabase::drop_database`, which does exactly this sweep for the
-/// database it's about to drop). Any stray connection to the template
-/// from a crashed test run, a dev poking at it with `psql`, a
-/// monitoring tool, anything currently makes every subsequent
-/// `create_test_database()` call fail outright, not just degrade.
+/// Previously (< 0.1.2)`create_test_database()` didn't sweep the *template* for lingering
+/// connections before cloning, so this test used to assert the *failure* on purpose,
+/// so that fixing the gap would force this test to be updated deliberately.
+/// That's exactly what we are doing, the fix landed, and
+/// this test's assertion flipps from `is_err()` to `is_ok()`.
 ///
 /// `TemplatePool` doesn't expose the template's own name, but
 /// `warmpool::fingerprint` (re-exported publicly, alongside
 /// `lock_key_from_fingerprint`, from the crate root) plus the same
 /// `warmpool_tmpl_` default prefix `TemplatePoolBuilder` uses is enough to
 /// reconstruct it deterministically without reaching into anything
-/// private, so this test tries to hold a real connection open against the real
-/// template and observe the actual failure failure.
-///
-/// This test is written to assert *current* behavior (the failure) so
-/// that if this gap is ever closed, this test starts failing and has to
-/// be updated deliberately not because we're endorsing the failure as
-/// correct, but because a silently passing test here would hide a
-/// meaningful behavior change either way, so we ae just being proactive about it.
+/// private, so this test can hold a real connection open against the real
+/// template and observe whether `create_test_database()` sweeps it away before cloning.
 #[tokio::test]
 // #[ignore]
-async fn test_stray_connection_to_template_currently_blocks_cloning() {
+async fn test_stray_connection_to_template_no_longer_blocks_cloning() {
     let salt = format!("stray_connection_{}", uuid::Uuid::new_v4());
     let url = shared_postgres_url().await;
     let connect_options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
@@ -631,11 +621,11 @@ async fn test_stray_connection_to_template_currently_blocks_cloning() {
     let warm_up = template.create_test_database().await.unwrap();
     warm_up.drop_database().await.ok();
 
-    // Reconstruct the template's name as TemplatePoolBuilder does,
+    // Reconstruct the template's name as TemplatePoolBuilder does:
     // same migrations directory (so the same Migration set and therefore
     // the same fingerprint), the same salt, and the crate's default
-    // `warmpool_tmpl_` prefix. This test never overrides
-    // `.template_prefix(...)`, so the default applies here too.
+    // `warmpool_tmpl_` prefix (this test never overrides
+    // `.template_prefix(...)`, so the default applies here too).
     let migrator =
         sqlx::migrate::Migrator::new(std::path::Path::new("./tests/fixtures/migrations"))
             .await
@@ -644,36 +634,174 @@ async fn test_stray_connection_to_template_currently_blocks_cloning() {
     let fingerprint = warmpool::fingerprint(&migrations, Some(&salt));
     let template_name = format!("warmpool_tmpl_{fingerprint}");
 
-    // Hold a real, lingering connection open directly against the template
+    // Hold a real, lingering connection open directly against the template,
     // exactly the kind of stray connection a crashed process or a
-    // dev's ad hoc `psql` session would leave behind.
+    // developer's ad hoc `psql` session would leave behind.
     let template_opts = connect_options.clone().database(&template_name);
-    let _lingering_template_connection = sqlx::PgPool::connect_with(template_opts)
-        .await
-        .expect("failed to connect directly to the template database");
+    let mut lingering_template_connection =
+        sqlx::postgres::PgConnection::connect_with(&template_opts)
+            .await
+            .expect("failed to connect directly to the template database");
 
     let result = template.create_test_database().await;
 
     assert!(
-        result.is_err(),
-        "current behavior: create_test_database() has no pg_terminate_backend \
-         sweep against the template before cloning, so a stray connection to \
-         the template (this test's `_lingering_template_connection`) makes \
-         this fail  exactly like it would for a crashed test run or a \
-         developer's leftover psql session against the same database in a \
-         an actual project, this is a real resilience gap that we are aware of and
-         shall be fixed in a future release to make warmpool robust against stray connections"
+        result.is_ok(),
+        "create_test_database() should sweep stray connections from the \
+         template before cloning and succeed despite the lingering \
+         connection this test opened; got {:?}",
+        result.err()
     );
-    if let Ok(db) = result {
-        // Only reached if this gap has since been fixed, clean up rather
-        // than leak a database in that case.
-        db.drop_database().await.ok();
-    }
+
+    // Prove the sweep actually did something, not just that the clone
+    // happened to succeed for an unrelated reason: the specific connection
+    // this test opened should now be dead, terminated by the sweep.
+    let alive_check: Result<bool, _> = sqlx::query_scalar("SELECT true")
+        .fetch_one(&mut lingering_template_connection)
+        .await;
+    let backend_alive = alive_check.is_ok();
+    assert!(
+        !backend_alive,
+        "the lingering connection this test opened should have been \
+         terminated by create_test_database()'s sweep. If it's still \
+         alive, the clone above succeeded for some other reason, not \
+         because the sweep worked"
+    );
+
+    let db = result.unwrap();
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'users')",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("failed to query table existence");
+    assert!(
+        exists,
+        "the clone that succeeded despite the stray connection must still \
+         be a real, fully migrated database, not a degenerate success"
+    );
+
+    db.drop_database().await.ok();
 }
 
-/// an excluded migration is not applied to test databases either
-/// The unit tests prove this at the Rust struct level, the excluded
-/// `Migration` is never stored. Here we proves it at the SQL level, the
+/// This is a concern we had and documented, does sweeping the template
+/// introduce any new race against a *legitimate, concurrent template
+/// build*? The advisory lock already serializes builds against each
+/// other, but the sweep in `create_test_database()` runs outside that
+/// lock, on the clone path, could it ever terminate a connection that's
+/// legitimately part of an in-progress build, rather than a genuine
+/// stray?
+///
+/// It can't, and this test is here to demonstrates why.
+/// `build_template_if_missing()` always closes its own connection to the template *before*
+/// `build_or_reuse_template()` releases the advisory lock.
+/// That means by the time any caller's `ensure_template()` call returns
+/// which is a precondition for reaching the sweep at all,no build for
+/// that same template can still be holding a connection open. Anything
+/// the sweep finds is therefore a genuine stray, never a build in
+/// progress.
+///
+/// This test exercises the part of that claim that's actually observable
+/// from outside the crate: an external connection opened *during* a cold
+/// build (while migrations are actively running) does not disrupt the
+/// build, and is itself cleanly swept away by the next clone attempt
+/// afterward, proving the sweep and the build path coexist safely.
+#[tokio::test]
+// #[ignore]
+async fn test_external_connection_during_a_build_does_not_disrupt_it_or_survive_the_next_sweep() {
+    let salt = format!("concurrent_build_observer_{}", uuid::Uuid::new_v4());
+    let url = shared_postgres_url().await;
+    let connect_options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+
+    let template = TemplatePool::builder(connect_options.clone())
+        .migrations_from("./tests/fixtures/migrations")
+        .fingerprint_salt(salt.clone())
+        .build()
+        .await
+        .expect("failed to build template pool");
+
+    // Reconstruct the template's name up front, before the template
+    // exists, the same way the previous test does.
+    let migrator =
+        sqlx::migrate::Migrator::new(std::path::Path::new("./tests/fixtures/migrations"))
+            .await
+            .expect("failed to load migrations for fingerprint reconstruction");
+    let migrations: Vec<_> = migrator.iter().cloned().collect();
+    let fingerprint = warmpool::fingerprint(&migrations, Some(&salt));
+    let template_name = format!("warmpool_tmpl_{fingerprint}");
+
+    // Race an external connection attempt against the first-ever build.
+    // The build creates the empty template database before it starts
+    // running migrations against it, so there's an actual window where the
+    // template exists but isn't finished yet, this task polls until it
+    // can connect, then holds the connection open across the rest of the
+    // build.
+    let connect_options_for_observer = connect_options.clone();
+    let template_name_for_observer = template_name.clone();
+    let observer = tokio::spawn(async move {
+        loop {
+            let opts = connect_options_for_observer
+                .clone()
+                .database(&template_name_for_observer);
+            match sqlx::postgres::PgConnection::connect_with(&opts).await {
+                Ok(conn) => return conn,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+            }
+        }
+    });
+
+    // Drive the actual cold build concurrently with the observer above
+    // trying to attach to it mid-flight.
+    let db = template
+        .create_test_database()
+        .await
+        .expect("the build must complete successfully regardless of the external observer");
+
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'users')",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("failed to query table existence");
+    assert!(
+        exists,
+        "the build must produce a fully migrated template even with an \
+         external connection attached partway through"
+    );
+    db.drop_database().await.ok();
+
+    // The observer should have managed to connect at some point during
+    // the build window it polls for up to the whole build's duration.
+    let mut observer_conn = tokio::time::timeout(std::time::Duration::from_secs(10), observer)
+        .await
+        .expect("observer task timed out")
+        .expect("observer task panicked");
+
+    // That lingering connection is still open right now. The *next*
+    // create_test_database() call's sweep must clean it up, exactly like
+    // it would for any other stray connection.
+    let second = template.create_test_database().await.expect(
+        "a lingering connection left over from during the build must not block a later clone",
+    );
+
+    let alive_check: Result<bool, _> = sqlx::query_scalar("SELECT true")
+        .fetch_one(&mut observer_conn)
+        .await;
+    let backend_alive = alive_check.is_ok();
+    assert!(
+        !backend_alive,
+        "the observer's connection, opened during the build and left \
+         open, should have been terminated by the second \
+         create_test_database() call's sweep"
+    );
+
+    second.drop_database().await.ok();
+}
+
+/// Integration confirmation of the `pool.rs` unit test finding: an
+/// excluded migration is not applied to test databases either.
+/// The unit tests prove this at the Rust struct leve, (the excluded
+/// `Migration` is never stored. This proves it at the SQL level, the
 /// table it would have created genuinely does not exist in a real, live
 /// clone.
 #[tokio::test]
@@ -706,13 +834,9 @@ async fn test_excluded_migration_is_absent_from_both_template_and_test_database(
     assert!(
         !has_posts,
         "excluding the migration that creates `posts` means the table must not \
-         exist in the cloned test database  confirming, against a real \
+         exist in the cloned test database -- confirming, against a real \
          database, that exclusion is not something applied post-clone"
     );
 
     db.drop_database().await.ok();
 }
-
-// test_excluded_migration_is_absent_from_both_template_and_test_database
-// test_purge_triggers_in_removes_triggers_from_cloned_database_only
-// test_template_is_reused_across_separate_template_pool_instances
