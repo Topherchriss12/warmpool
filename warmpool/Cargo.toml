@@ -22,7 +22,7 @@ thiserror = "2"
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 futures-util = "0.3"
-warmpool-macros = { path = "../warmpool-macros", version = "0.1.0", optional = true }
+warmpool-macros = { path = "../warmpool-macros", version = "0.1.2", optional = true }
 
 [features]
 default = []

@@ -39,3 +39,25 @@ Two related ideas came out of the same investigation and are deliberately **not*
 Anyone reading this: please note that the above two items are **not** part of this release, but are included here to document the thinking and tradeoffs that led to the current design. And to make it clear that the next steps are already on the roadmap, so that users can plan accordingly.
 
 - No new dependencies. This release only adds code.
+
+
+## 0.1.2
+
+### Fixed
+
+- **No stale connection sweep on the template before cloning** (EDGES.md #1). `create_test_database()` now clears stray connections from the template  via `pg_terminate_backend`, on the same maintenance connection already open, immediately before the `CREATE DATABASE ... TEMPLATE ...` statement before every clone. Previously, any connection to the template that wasn't warmpool's own (a crashed test process, a developer's leftover `psql` session, a monitoring query) made every subsequent clone fail outright with `source database "..." is being accessed by other users` until that connection closed on its own.
+
+
+### Added
+
+- `Error::TemplateConnectionSweep`; The new failure mode if the sweep itself can't run (the clone attempt is aborted before the `CREATE DATABASE` statement in that case, same as any other pre-clone failure).
+- `terminate_other_backends()`; an internal helper shared between the new template sweep in `create_test_database()` and the existing test database sweep in `TestDatabase::drop_database()`, which already did this same kind of sweep for the database it owns. Same query, two call sites, two different `Error` variants at each. This is a small refactor to avoid duplicating the query text while implementing the fix.
+- Two integration tests:
+  - `test_stray_connection_to_template_no_longer_blocks_cloning`; Replaces the test that used to document this gap as a known, unfixed failure. Now asserts the clone succeeds despite a lingering connection, and that the specific connection the test opened was actually terminated by the sweep, not merely that the clone happened to succeed some other way.
+  - `test_external_connection_during_a_build_does_not_disrupt_it_or_survive_the_next_sweep`; A concern raised in `EDGES.md` #1: does the sweep introduce a race against a legitimate, concurrent template build? Answer: it can't, and it is by construction. `build_template_if_missing()` always closes its own connection to the template before the advisory lock is released, so nothing reaching the sweep step (which requires the lock to have already been released) can ever be a connection from a build still in progress. This test proves the observable half of this claim: an external connection opened *during* a cold build doesn't disrupt the build, and is itself cleanly swept away on the next clone attempt afterward.
+
+### Compatibility
+
+No breaking changes. `Error::TemplateConnectionSweep` is additive for `Error` is `#[non_exhaustive]` as of 0.1.1.
+
+No new dependencies. This release fixes a bug.

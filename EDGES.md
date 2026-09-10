@@ -19,13 +19,13 @@ Four things determine where an item sits in the sequence below, roughly in this 
 
 | # | Sharp edge | Status | Target | Kind |
 |---|---|---|---|---|
-| 1 | No stale connection sweep on the template before cloning | Open | 0.1.2 | Bug fix |
+| 1 | No stale connection sweep on the template before cloning | **Resolved** | 0.1.2 | Bug fix |
 | 2 | Template construction isn't crash atomic | Open | 0.1.3 | Bug fix |
 | 3 | `purge_triggers_sql` doesn't escape the schema literal | Open | 0.1.4 | Bug fix |
 | 4 | `create_test_database_sql` doesn't escape the template prefix identifier | Open | 0.1.5 | Bug fix |
 | 5 | `exclude_migration`'s actual behavior may not be the behavior it appears to be, atleast for now | Open | pending | Design decision |
 
-Nothing is in "Resolved" yet. This table is the first thing that changes when something is.
+One item "Resolved" four to go. This table is the first thing that changes when something is.
 
 ---
 
@@ -33,7 +33,7 @@ Nothing is in "Resolved" yet. This table is the first thing that changes when so
 
 ### 1. No stale connection sweep on the template before cloning
 
-**Status:** Open · **Target:** 0.1.2 · Fails loudly.
+**Status:** Resolved · **Target:** 0.1.2 · Fails loudly.
 
 **What's broken:** `create_test_database()` issues `CREATE DATABASE ... TEMPLATE <name> ...` with no guard against other connections to the template. Postgres refuses that statement outright if *anyone* is
 connected to the source database not just warmpool's own connections.
@@ -66,7 +66,7 @@ sqlx::query(
 **Concerns** Does sweeping the template introduces any new race against a *concurrent template build* the advisory lock already serializes builds against each other, but this sweep runs outside that lock, on the clone path, and needs to be checked against the build path's own connection lifecycle so it can't
 accidentally terminate a build that's legitimately in progress. Test coverage should include a test that opens a connection to the template and verifies that `create_test_database()` terminates it and proceeds, and a test that opens a connection to the template while a build is in progress and verifies that the build completes successfully and the clone fails with the expected "template is being accessed by other users" error.
 
-**Tracking:** to be filed as its own issue before work begins.
+**Tracking:** was filed as its own issue before work began.
 
 ---
 
@@ -160,7 +160,23 @@ link once it exists.
 
 ## Resolved
 
-Nothing yet. Entries move here, in order, with a link to the change that closed them, as each one lands. This section existing and staying empty or stale for a while is expected the ordering above is deliberately sequential, not parallel and we don't want to give the impression that any of the open items are already resolved.
+### 1. No stale-connection sweep on the template before cloning
+
+**Resolved in:** 0.1.2 · Fails loudly, fixed with a sweep.
+
+`create_test_database()` issued `CREATE DATABASE ... TEMPLATE <name> ...` with no guard against other connections to the template. Postgres refuses that statement outright if *anyone* is connected to the source
+database, not just warmpool's own connections. A crashed test process, a developer's leftover `psql` session, a monitoring query, anything, made every subsequent clone fail until the stray connection closed on its own.
+
+**The fix:** a `pg_terminate_backend` sweep against the template's `datname`, run on the same maintenance connection already open in `create_test_database()`, immediately before the `CREATE DATABASE ...
+TEMPLATE` statement mirroring the sweep `TestDatabase::drop_database()` already did for the database it owns. Shared via a `terminate_other_backends()` helper shared by both call sites but serves different purposes: `drop_database()` sweeps the database it owns, `create_test_database()` sweeps the template it clones from. Both are advisory, both are best effort, both are run on the same connection that executes the subsequent statement that needs the sweep to succeed.
+
+**Concerns This Fix Raised**. Does the sweep introduce a race against a legitimate, concurrent template build? The advisory lock guarded section that both the build path and the clone path touch, verifies that `build_template_if_missing()` always closes its own connection to the template before releasing the lock. That means nothing that reaches the sweep (which requires the lock to already be released) can ever be a connection from a build still in progress only a genuine stray.
+
+`test_external_connection_during_a_build_does_not_disrupt_it_or_survive_the_next_sweep` verifies that a connection opened to the template while a build is in progress is not terminated by the sweep, and that the build completes successfully. `test_stray_connection_to_template_no_longer_blocks_cloning` verifies that a connection opened to the template before `create_test_database()` is called is terminated by the sweep, and the clone succeeds.
+
+**What this fix does not close:** a connection can still theoretically race in during the small window between the sweep completing and the `CREATE DATABASE` statement executing. See the `Error::TemplateConnectionSweep` error variant that was added to `warmpool::Error` to make this failure mode explicit. The sweep closes the window on a *pre-existing* stray connection, but it cannot prevent a brand new connection from racing in during that small window. That residual window is accepted, not eliminated, by this fix.
+
+**[ISSUE#1](https://github.com/Topherchriss12/warmpool/issues/1#issue-5384723346)**
 
 ---
 
