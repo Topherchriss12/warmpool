@@ -78,6 +78,22 @@ Troubleshooting
 - `template database does not exist` — run the `createdb` + migrations step first.
 - Cleanup warnings about leftover `wp_bench_*` databases — run the cleanup loop in `bench_clone_strategy.sh` again or drop those databases manually; ensure the role has appropriate permissions.
 
+
+Reproducing the orphaned `_building` scenario locally (EDGES #2)
+----------------------------------------------------------------
+
+If you want to confirm the crash atomic template flow against your own loal Postgres instance, run the local reproduction script in [scripts/reproduce_orphan_building.sh](scripts/reproduce_orphan_building.sh):
+
+```bash
+PGURL="postgres://postgres:postgres@127.0.0.1:5432/postgres" ./scripts/reproduce_orphan_building.sh
+```
+
+The script creates a partial orphaned `_building` database, executes the cleanup -> rebuild -> sweep -> rename flow, and prints the resulting schema so you can verify that the final template contains the complete migration set rather than the orphan's partial state.
+
+***Do not point PGURL at a database containing data you need to preserve and obviously not to a production database***.
+
+
+
 Contact
 -------
 For questions about the benchmark or interpretation, please open an issue in this repository.

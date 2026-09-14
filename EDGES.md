@@ -20,7 +20,7 @@ Four things determine where an item sits in the sequence below, roughly in this 
 | # | Sharp edge | Status | Target | Kind |
 |---|---|---|---|---|
 | 1 | No stale connection sweep on the template before cloning | **Resolved** | 0.1.2 | Bug fix |
-| 2 | Template construction isn't crash atomic | Open | 0.1.3 | Bug fix |
+| 2 | Template construction isn't crash atomic | **Resolved** | 0.1.3 | Bug fix |
 | 3 | `purge_triggers_sql` doesn't escape the schema literal | Open | 0.1.4 | Bug fix |
 | 4 | `create_test_database_sql` doesn't escape the template prefix identifier | Open | 0.1.5 | Bug fix |
 | 5 | `exclude_migration`'s actual behavior may not be the behavior it appears to be, atleast for now | Open | pending | Design decision |
@@ -33,7 +33,7 @@ One item "Resolved" four to go. This table is the first thing that changes when 
 
 ### 1. No stale connection sweep on the template before cloning
 
-**Status:** Resolved · **Target:** 0.1.2 · Fails loudly.
+**Status:** Resolved · **Target:** 0.1.2 · Failed loudly.
 
 **What's broken:** `create_test_database()` issues `CREATE DATABASE ... TEMPLATE <name> ...` with no guard against other connections to the template. Postgres refuses that statement outright if *anyone* is
 connected to the source database not just warmpool's own connections.
@@ -72,7 +72,7 @@ accidentally terminate a build that's legitimately in progress. Test coverage sh
 
 ### 2. Template construction isn't crash-atomic
 
-**Status:** Open · **Target:** 0.1.3 · Fails silently, but worse than it sounds.
+**Status:** Resolved · **Target:** 0.1.3 · Failed silently, but was worse than it sounds.
 
 **What's broken:** `build_template_if_missing()` creates the template database under its final, fingerprinted name and runs migrations against it in place. If the process building it dies mid-migration like a killed CI
 job, an OOM, a migration that panics the process instead of returning an `Err`, the template exists under its expected name with only some migrations applied. The next process to call `ensure_template()` runs its existence check (`SELECT EXISTS (... FROM pg_database WHERE datname =$1)`), finds the row, and treats the template as ready. Every clone from that point on is missing whatever didn't finish applying.
@@ -91,7 +91,7 @@ from Postgres's catalog perspective there is no window where a half migrated dat
 Also, what happens to an orphaned `<name>_building` database left behind by a crash under the *new* code ?
 Does a later build attempt clean it up, or does it need its own explicit handling to avoid accumulating half built templates under `_building` names the same way stale full templates already can.
 
-**Tracking:** to be filed as its own issue, referencing #1's resolution.
+**Tracking:** was filed as its own issue before work began.
 
 ---
 
@@ -160,9 +160,35 @@ link once it exists.
 
 ## Resolved
 
+ 
+### 2. Template construction isn't crash-atomic
+ 
+**Resolved in:** 0.1.3 .
+ 
+`build_template_if_missing()` created the template database under its final, fingerprinted name and ran migrations against it in place. A crash mid migration left a half migrated database sitting under that name; the existence check on the next attempt couldn't tell "fully built" from "started and never finished," so every clone afterward
+silently got an incomplete schema failing downstream with `relation "..." does not exist` on some but not all tables, which reads like a real schema bug, not an infrastructure one.
+ 
+**The fix:** build under a `<name>_building` suffix, migrate there in full, and only`ALTER DATABASE <name>_building RENAME TO <name>` after every migration succeeds. From Postgres's catalog perspective the rename
+is a single operation, no window exists where a half migrated database sits under the final name.
+ 
+**A concern raised when this was discovered**; what happens to an orphaned `_building` database left behind by a crash under the new code ? Cleanup of any leftover `_building` runs unconditionally at the start of every fresh
+build (inside the same advisory lock, so anything found is necessarily an orphan from a past attempt, never a build in progress elsewhere, same reasoning behind #1's concurrency concern). Skipping this cleanup would have made the fix worse than the bug itself: a crashed build would permanently block every future attempt at that fingerprint, since `CREATE DATABASE` would keep failing against the orphan forever.
+
+**Reproduce locally:** you can confirm the same flow on your own Postgres instance, run the script in `scripts/reproduce_orphan_building.sh`:
+
+```bash
+PGURL="postgres://postgres:postgres@127.0.0.1:5432/postgres" ./scripts/reproduce_orphan_building.sh
+```
+
+The script creates an orphaned `_building` database with a partially applied schema, replays the cleanup -> rebuild -> sweep -> rename flow, and prints the final table list so you can confirm the final template contains the complete schema rather than the orphan's partial state.
+
+***Do not point PGURL at a database containing data you need to preserve and obviously not to a production database***.
+
+**[ISSUE#2](https://github.com/Topherchriss12/warmpool/issues/2#issue-5408173016)**
+
 ### 1. No stale-connection sweep on the template before cloning
 
-**Resolved in:** 0.1.2 · Fails loudly, fixed with a sweep.
+**Resolved in:** 0.1.2 .
 
 `create_test_database()` issued `CREATE DATABASE ... TEMPLATE <name> ...` with no guard against other connections to the template. Postgres refuses that statement outright if *anyone* is connected to the source
 database, not just warmpool's own connections. A crashed test process, a developer's leftover `psql` session, a monitoring query, anything, made every subsequent clone fail until the stray connection closed on its own.

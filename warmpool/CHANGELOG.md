@@ -51,13 +51,54 @@ Anyone reading this: please note that the above two items are **not** part of th
 ### Added
 
 - `Error::TemplateConnectionSweep`; The new failure mode if the sweep itself can't run (the clone attempt is aborted before the `CREATE DATABASE` statement in that case, same as any other pre-clone failure).
+
 - `terminate_other_backends()`; an internal helper shared between the new template sweep in `create_test_database()` and the existing test database sweep in `TestDatabase::drop_database()`, which already did this same kind of sweep for the database it owns. Same query, two call sites, two different `Error` variants at each. This is a small refactor to avoid duplicating the query text while implementing the fix.
+
 - Two integration tests:
   - `test_stray_connection_to_template_no_longer_blocks_cloning`; Replaces the test that used to document this gap as a known, unfixed failure. Now asserts the clone succeeds despite a lingering connection, and that the specific connection the test opened was actually terminated by the sweep, not merely that the clone happened to succeed some other way.
+
   - `test_external_connection_during_a_build_does_not_disrupt_it_or_survive_the_next_sweep`; A concern raised in `EDGES.md` #1: does the sweep introduce a race against a legitimate, concurrent template build? Answer: it can't, and it is by construction. `build_template_if_missing()` always closes its own connection to the template before the advisory lock is released, so nothing reaching the sweep step (which requires the lock to have already been released) can ever be a connection from a build still in progress. This test proves the observable half of this claim: an external connection opened *during* a cold build doesn't disrupt the build, and is itself cleanly swept away on the next clone attempt afterward.
 
 ### Compatibility
 
 No breaking changes. `Error::TemplateConnectionSweep` is additive for `Error` is `#[non_exhaustive]` as of 0.1.1.
+
+No new dependencies. This release fixes a bug.
+
+
+## 0.1.3
+ 
+### Fixed
+ 
+- **Template construction atomicity** (EDGES.md #2). `build_template_if_missing()` used to create the template database under its final, fingerprinted name and run migrations against it in place. A crash mid-migration like a killed CI job, an OOM, a migration panicking the process left a half migrated database sitting under that name; the existence check on the next attempt had no way to tell "fully built" from "started and never finished," so every clone afterward silently got an incomplete schema, failing downstream with `relation "..." does not exist` on some but not all tables rather than a clear infrastructure error.
+
+The template is now built under a `<name>_building` suffix, migrated there in full, and only `ALTER DATABASE <name>_building RENAME TO <name>` after every migration succeeds. From Postgres's catalog perspective the rename is a single operation there is no window where a half migrated database exists under the final name.
+
+### Added
+ 
+- `Error::CleanupStaleBuildingDb`; fired if clearing away a `_building` database left over from a previous crashed attempt fails. This cleanup runs unconditionally at the start of every fresh build (not just when an orphan is suspected. `DROP DATABASE IF EXISTS` against a name that was never created is a no-op), because skipping it would mean a single crashed build permanently blocks every future attempt at that fingerprint: `CREATE DATABASE` would keep failing with "already exists" against the orphan, forever.
+
+- `Error::TemplateRename`; fired if the final promotion step itself fails. On failure, `_building` is left fully migrated but not yet promoted; the next build attempt's `CleanupStaleBuildingDb` sweep finds it, drops it, and rebuilds from scratch and does not try to resume or reuse it.
+
+- `terminate_other_backends()` is joined by a new `sweep_and_drop_database()` helper (sweep, then `DROP DATABASE IF EXISTS`) shared between `TestDatabase::drop_database()` and the new orphan cleanup, same small supporting refactor pattern as `terminate_other_backends()` itself in 0.1.2.
+
+- Two new pure function unit tests (`rename_database_sql`, `drop_database_if_exists_sql`) alongside the existing SQL builder tests.
+
+- Two new integration tests:
+  - `test_orphaned_building_database_is_cleaned_up_and_rebuilt`; constructs the exact end state a crash would leave behind (a `_building` database with only the first of several migrations applied, no final name database at all) by going around the public API the same way `warmpool::fingerprint` is already used elsewhere in the suite to reconstruct names, then drives an ordinary `create_test_database()` call and confirms the orphan is dropped and a **complete** fresh template is built, not that the half built one is resumed or patched.
+
+  - `test_template_is_reusable_normally_after_orphan_recovery`; confirms that once an orphan has been cleaned up and rebuilt once, later clones from the same `TemplatePool` take the ordinary fast path (existence check finds it, returns immediately) and does not re-triggering cleanup every time.
+
+### Design context and physical verification
+
+`ALTER DATABASE ... RENAME` has the same active connection restriction as `CREATE DATABASE ... TEMPLATE`, which Postgres enforces with the same SQLSTATE (`55006`). In practice, this means the final promotion step also needs a connection sweep immediately before it runs; a stray connection can attach to the `_building` database while migrations are still finishing and persist long enough to block the rename even after the build's own connection has been closed.
+
+To keep the error reporting accurate in both places, `Error::TemplateConnectionSweep` uses the broader wording "failed to clear stray connections from `{name}`". The variant is the same one used before cloning and during the final rename step; this is a wording only adjustment to an existing, non-exhaustive enum variant, not a structural change.
+
+In development the cleanup, rebuild, and rename flow was validated against a live Postgres instance before being added to the automated test suite. In that verification, a `_building` orphan with a partial schema was constructed by hand, the exact sequence used by the library was executed step by step, and the final state was confirmed: the orphan was removed, the final template database existed with the complete schema, and no partial state remained behind. This also confirmed the live Postgres behavior behind the rename restriction before it was relied on in the implementation.
+
+### Compatibility
+
+No breaking changes.
 
 No new dependencies. This release fixes a bug.

@@ -840,3 +840,210 @@ async fn test_excluded_migration_is_absent_from_both_template_and_test_database(
 
     db.drop_database().await.ok();
 }
+
+/// A crash mid-migration (a killed CI job, an OOM, a migration panicking the
+/// process) leaves a half migrated database sitting under the
+/// template's final, fingerprinted name and the existence check in
+/// `build_template_if_missing()` had no way to distinguish that from a
+/// genuinely finished template prior to 0.1.3, so every clone afterward silently got a
+/// broken schema.
+///
+/// There's no way to literally kill a process mid migration from inside a
+/// single test function and have anything left to assert against
+/// afterward (we have tried), so this test constructs the *end state* a crash would leave
+/// behind directly: a `_building` database that exists and has some, but
+/// not all, of the migrations applied, with the final name not existing
+/// at all bypassing the public API entirely to build it, the same way
+/// `warmpool::fingerprint` is used elsewhere to reconstruct
+/// names without reaching into anything private. Then it drives a
+/// completely ordinary `create_test_database()` call for that exact
+/// fingerprint and confirms the orphan gets cleaned up and a fresh,
+/// *complete* template gets built, not that the half built one is
+/// somehow resumed or reused.
+#[tokio::test]
+// #[ignore]
+async fn test_orphaned_building_database_is_cleaned_up_and_rebuilt() {
+    let salt = format!("orphan_building_{}", uuid::Uuid::new_v4());
+    let url = shared_postgres_url().await;
+    let connect_options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+
+    // Reconstruct the exact names warmpool would use for this fingerprint,
+    // the same way test_stray_connection_to_template_no_longer_blocks_cloning
+    // and its sibling already do.
+    let migrator =
+        sqlx::migrate::Migrator::new(std::path::Path::new("./tests/fixtures/migrations"))
+            .await
+            .expect("failed to load migrations for fingerprint reconstruction");
+    let migrations: Vec<_> = migrator.iter().cloned().collect();
+    let fingerprint = warmpool::fingerprint(&migrations, Some(&salt));
+    let template_name = format!("warmpool_tmpl_{fingerprint}");
+    let building_name = format!("{template_name}_building");
+
+    // Build the orphan directly: a `_building` database with only the
+    // *first* migration applied (`users`, no `widgets`/`gadgets`/seed
+    // data), and never renamed, exactly what a crash right after the
+    // first migration committed, but before the second one ran, would
+    // leave behind.
+    let mut maintenance = sqlx::postgres::PgConnection::connect_with(&connect_options)
+        .await
+        .expect("failed to open a maintenance connection for test setup");
+    sqlx::query(&format!(r#"CREATE DATABASE "{building_name}""#))
+        .execute(&mut maintenance)
+        .await
+        .expect("test setup: failed to create the simulated orphan _building database");
+
+    let building_opts = connect_options.clone().database(&building_name);
+    let mut building_conn = sqlx::postgres::PgConnection::connect_with(&building_opts)
+        .await
+        .expect("test setup: failed to connect to the simulated orphan");
+    sqlx::raw_sql(migrations[0].sql.as_ref())
+        .execute(&mut building_conn)
+        .await
+        .expect("test setup: failed to apply the first migration to the simulated orphan");
+    drop(building_conn);
+
+    // Confirm the test setup actually produced the state we think it should and did,
+    // before making any claim about what warmpool does with it.
+    let orphan_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)")
+            .bind(&building_name)
+            .fetch_one(&mut maintenance)
+            .await
+            .unwrap();
+    assert!(
+        orphan_exists,
+        "test setup: the simulated orphan must exist before the real assertions run"
+    );
+    let final_exists_before: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)")
+            .bind(&template_name)
+            .fetch_one(&mut maintenance)
+            .await
+            .unwrap();
+    assert!(
+        !final_exists_before,
+        "test setup: the final template name must not exist yet -- \
+         only the orphan does, same as after a real crash"
+    );
+
+    // Now drive a completely ordinary create_test_database() call for
+    // this exact fingerprint. Before, build_template_if_missing()
+    // would have tried `CREATE DATABASE "{template_name}"` directly and
+    // this test would still be sitting on the orphan; there was nothing
+    // here to detect or clean it up.
+    let template = TemplatePool::builder(connect_options.clone())
+        .migrations_from("./tests/fixtures/migrations")
+        .fingerprint_salt(salt)
+        .build()
+        .await
+        .expect("failed to build template pool");
+
+    let db = template.create_test_database().await.expect(
+        "create_test_database() should clean up the orphaned _building \
+         database and build a fresh template, not get stuck failing with \
+         \"database already exists\" against the orphan forever",
+    );
+
+    // The clone must have the full schema, all four migrations, not
+    // just the one the orphan happened to have, proving a genuine fresh
+    // rebuild happened and the half built orphan was not resumed,
+    // patched, or reused as-is.
+    for table in ["users", "widgets", "gadgets"] {
+        let exists: bool = sqlx::query_scalar(&format!(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = '{table}')"
+        ))
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(
+            exists,
+            "table `{table}` must exist -- the rebuild must be complete, \
+             not resuming from the orphan's partial state"
+        );
+    }
+
+    // The orphan is gone, dropped during cleanup, its replacement
+    // consumed by the rename into the final name. Nothing should be
+    // left sitting under the `_building` suffix.
+    let building_still_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)")
+            .bind(&building_name)
+            .fetch_one(&mut maintenance)
+            .await
+            .unwrap();
+    assert!(
+        !building_still_exists,
+        "the _building database must not linger after a successful rebuild"
+    );
+
+    db.drop_database().await.ok();
+}
+
+/// A second, independent build attempt for the *same* fingerprint after
+/// an orphan has already been cleaned up and rebuilt once must not somehow
+/// re-encounter the orphan or otherwise behave differently the second
+/// time. The cleanup and rebuild path in `build_template_if_missing()`
+/// only runs when the final template name doesn't exist yet, so once a
+/// rebuild has succeeded, later calls should take the ordinary fast path
+/// (existence check finds it, returns immediately) exactly like any other
+/// already built template.
+#[tokio::test]
+// #[ignore]
+async fn test_template_is_reusable_normally_after_orphan_recovery() {
+    let salt = format!("orphan_then_reuse_{}", uuid::Uuid::new_v4());
+    let url = shared_postgres_url().await;
+    let connect_options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+
+    let migrator =
+        sqlx::migrate::Migrator::new(std::path::Path::new("./tests/fixtures/migrations"))
+            .await
+            .expect("failed to load migrations for fingerprint reconstruction");
+    let migrations: Vec<_> = migrator.iter().cloned().collect();
+    let fingerprint = warmpool::fingerprint(&migrations, Some(&salt));
+    let template_name = format!("warmpool_tmpl_{fingerprint}");
+    let building_name = format!("{template_name}_building");
+
+    // Simulate the orphan, then let a real
+    // TemplatePool clean it up and rebuild.
+    let mut maintenance = sqlx::postgres::PgConnection::connect_with(&connect_options)
+        .await
+        .expect("failed to open a maintenance connection for test setup");
+    sqlx::query(&format!(r#"CREATE DATABASE "{building_name}""#))
+        .execute(&mut maintenance)
+        .await
+        .expect("test setup: failed to create the simulated orphan");
+
+    let template = TemplatePool::builder(connect_options.clone())
+        .migrations_from("./tests/fixtures/migrations")
+        .fingerprint_salt(salt)
+        .build()
+        .await
+        .expect("failed to build template pool");
+
+    let first = template
+        .create_test_database()
+        .await
+        .expect("first clone should trigger orphan cleanup and a successful rebuild");
+    first.drop_database().await.ok();
+
+    // Second clone from the same TemplatePool, after recovery already
+    // happened once: this should be a completely ordinary, fast clone,
+    // not another cleanup and rebuild cycle.
+    let second = template
+        .create_test_database()
+        .await
+        .expect("second clone after successful orphan recovery should behave normally");
+
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'widgets')",
+    )
+    .fetch_one(second.pool())
+    .await
+    .unwrap();
+    assert!(
+        exists,
+        "the second clone must have the full, recovered schema"
+    );
+
+    second.drop_database().await.ok();
+}

@@ -353,29 +353,88 @@ async fn build_template_if_missing(
         return Ok(());
     }
 
+    // Build under a `_building` suffix and only rename into the final
+    // name after every migration succeeds, so a crash mid-build (a killed
+    // CI job, an OOM, a migration panicking the process) can never leave
+    // a half migrated database sitting under `template_name`, where the
+    // existence check above would mistake it for a finished template.
+    let building_name = format!("{template_name}_building");
+
+    // Clean up a `_building` database left over from a previous crashed
+    // attempt at this exact fingerprint, if there is one. We're inside
+    // the advisory lock for this fingerprint right now, so anything found
+    // under this name is necessarily an orphan from a *past* attempt, not
+    // a build in progress elsewhere, same reasoning as the
+    // template connection sweep in create_test_database(). Skipping this is very bad,
+    // because it would mean a crashed build permanently blocks every future attempt
+    // at this fingerprint: warmpool's own CREATE DATABASE below would keep
+    // failing with "already exists" against the orphan, forever.
+    sweep_and_drop_database(maintenance, &building_name)
+        .await
+        .map_err(|source| Error::CleanupStaleBuildingDb {
+            name: building_name.clone(),
+            source,
+        })?;
+
     maintenance
-        .execute(create_template_database_sql(template_name).as_str())
+        .execute(create_template_database_sql(&building_name).as_str())
         .await
         .map_err(|source| Error::CreateTemplateDb {
-            name: template_name.to_string(),
+            name: building_name.clone(),
             source,
         })?;
 
-    let template_opts = connect_options.clone().database(template_name);
+    let building_opts = connect_options.clone().database(&building_name);
 
-    let template_pool = PgPool::connect_with(template_opts)
+    let template_pool = PgPool::connect_with(building_opts)
         .await
         .map_err(|source| Error::TemplatePoolConnect {
-            name: template_name.to_string(),
+            name: building_name.clone(),
             source,
         })?;
 
-    run_migrations(&template_pool, template_name, migrations).await?;
+    // Errors from here report `building_name`, not `template_name`: at
+    // this point `building_name` is the only one of the two that actually
+    // exists, and it's what a dev would need to connect to in order
+    // to inspect exactly how far a failed build got.
+    run_migrations(&template_pool, &building_name, migrations).await?;
 
-    // Postgres refuses `CREATE DATABASE ...
-    // TEMPLATE x` while any connection remains open against x. Every clone
-    // in create_test_database() depends on this having already happened.
+    // Postgres refuses `CREATE DATABASE ... TEMPLATE x` and `ALTER
+    // DATABASE x RENAME` alike while any connection remains open against x.
+    // Every clone in create_test_database() already depends on the first half of that;
+    // the rename immediately below depends on it too.
     template_pool.close().await;
+
+    // A stray connection could have attached to `_building` while
+    // migrations were running (the equivalent scenario is exercised for
+    // the clone path by `test_external_connection_during_a_build_...` in
+    // the integration suite) and lingered past our own close() above.
+    // Sweep again immediately before the rename, for the same reason
+    // create_test_database() sweeps immediately before its own
+    // connection sensitive statement.
+    terminate_other_backends(maintenance, &building_name)
+        .await
+        .map_err(|source| Error::TemplateConnectionSweep {
+            name: building_name.clone(),
+            source,
+        })?;
+
+    // The atomic handoff. From Postgres's catalog perspective this rename
+    // is a single operation: either it succeeds and `template_name` is
+    // now the fully migrated database, or it fails and `template_name`
+    // still doesn't exist at all, there is no window where a
+    // half migrated database exists under the final name. If it fails,
+    // `building_name` (now fully migrated but not yet promoted) is left
+    // for the next build attempt's `CleanupStaleBuildingDb` sweep to drop
+    // and rebuild from scratch, same as any other orphan.
+    maintenance
+        .execute(rename_database_sql(&building_name, template_name).as_str())
+        .await
+        .map_err(|source| Error::TemplateRename {
+            from: building_name,
+            to: template_name.to_string(),
+            source,
+        })?;
 
     Ok(())
 }
@@ -453,7 +512,7 @@ async fn purge_triggers(conn: &mut PgConnection, schema: &str) -> Result<()> {
 
 // SQL / connection management helpers
 //
-// These three `*_sql` functions are extracted so the exact statement text is
+// The three `*_sql` functions are extracted so the exact statement text is
 // unit testable without a live Postgres connection. None of these do any
 // escaping beyond wrapping identifiers in double quotes / literals in
 // single quotes.
@@ -474,13 +533,25 @@ fn create_template_database_sql(template_name: &str) -> String {
     format!(r#"CREATE DATABASE "{template_name}";"#)
 }
 
+/// Used both to promote a fully migrated `_building` database into its
+/// final name, and (were it ever needed elsewhere) any other database
+/// rename. See `Error::TemplateRename` for what atomicity guarantee this
+/// buys `build_template_if_missing()`.
+fn rename_database_sql(from: &str, to: &str) -> String {
+    format!(r#"ALTER DATABASE "{from}" RENAME TO "{to}";"#)
+}
+
+fn drop_database_if_exists_sql(name: &str) -> String {
+    format!(r#"DROP DATABASE IF EXISTS "{name}";"#)
+}
+
 /// `schema` is interpolated directly into a single quoted SQL string
 /// literal (`WHERE nspname = '{schema}'`) rather than passed as a bound
 /// parameter, this DO block can't take one, since `EXECUTE format(...)`
 /// only parameterizes the identifiers it formats, not the literal driving
-/// the `WHERE` clause itself. In practice `schema` is a compile time-ish
+/// the `WHERE` clause itself. In practice `schema` is a compile-time-ish
 /// config value from [`TemplatePoolBuilder::purge_triggers_in`], not
-/// end-user input, so this hasn't been a practical problem  but it is
+/// end-user input, so this hasn't been a practical problem  but it *is*
 /// unescaped, and a schema name containing a `'` breaks out of the
 /// literal. `purge_triggers_sql_does_not_escape_embedded_quotes`
 /// documents this. We are not pretending it isn't there.
@@ -506,7 +577,9 @@ fn purge_triggers_sql(schema: &str) -> String {
     )
 }
 
-/// Terminate every other backend connected to `datname`.
+/// Terminate every other backend connected to `datname`. See the block
+/// comment `sweep_and_drop_database` for why this isn't a `*_sql`
+/// pure string function like the others.
 async fn terminate_other_backends(
     conn: &mut PgConnection,
     datname: &str,
@@ -521,6 +594,24 @@ async fn terminate_other_backends(
     .bind(datname)
     .execute(conn)
     .await?;
+    Ok(())
+}
+
+/// Sweep stray connections from `name`, then drop it if it exists.
+/// `DROP DATABASE IF EXISTS` against a name that was never created is a
+/// no-op, so this is always safe to call whether or not `name` actually
+/// exists. Shared between `TestDatabase::drop_database()` and the
+/// leftover-`_building` cleanup in `build_template_if_missing()`. same
+/// two step operation, two different reasons to run it, two different
+/// `Error` variants at the two call sites (mapped by each caller, not
+/// here, same pattern as `terminate_other_backends`).
+async fn sweep_and_drop_database(
+    conn: &mut PgConnection,
+    name: &str,
+) -> std::result::Result<(), sqlx::Error> {
+    terminate_other_backends(conn, name).await?;
+    conn.execute(drop_database_if_exists_sql(name).as_str())
+        .await?;
     Ok(())
 }
 
@@ -554,17 +645,7 @@ impl TestDatabase {
             .await
             .map_err(Error::MaintenanceConnect)?;
 
-        // Terminating lingering backends first and then issuing a plain
-        // `DROP DATABASE` works on every supported version.
-        terminate_other_backends(&mut maintenance, &self.name)
-            .await
-            .map_err(|source| Error::DropTestDb {
-                name: self.name.clone(),
-                source,
-            })?;
-
-        maintenance
-            .execute(format!(r#"DROP DATABASE IF EXISTS "{}";"#, self.name).as_str())
+        sweep_and_drop_database(&mut maintenance, &self.name)
             .await
             .map_err(|source| Error::DropTestDb {
                 name: self.name.clone(),
@@ -792,6 +873,22 @@ mod tests {
     }
 
     #[test]
+    fn rename_database_sql_targets_the_right_names() {
+        assert_eq!(
+            rename_database_sql("warmpool_tmpl_xyz_building", "warmpool_tmpl_xyz"),
+            r#"ALTER DATABASE "warmpool_tmpl_xyz_building" RENAME TO "warmpool_tmpl_xyz";"#
+        );
+    }
+
+    #[test]
+    fn drop_database_if_exists_sql_is_idempotent_by_construction() {
+        assert_eq!(
+            drop_database_if_exists_sql("warmpool_tmpl_xyz_building"),
+            r#"DROP DATABASE IF EXISTS "warmpool_tmpl_xyz_building";"#
+        );
+    }
+
+    #[test]
     fn purge_triggers_sql_targets_the_given_schema() {
         let sql = purge_triggers_sql("public");
         assert!(sql.contains("nspname = 'public'"));
@@ -832,5 +929,53 @@ mod tests {
             sql.contains(r#""warmpool_tmpl_"; DROP TABLE users;""#),
             "current behavior: the embedded quote is not escaped"
         );
+    }
+
+    #[test]
+    fn template_pool_builder_entrypoint_is_available() {
+        let connect = dummy_connect_options();
+        let builder = TemplatePool::builder(connect.clone());
+
+        assert_eq!(builder.template_prefix, "warmpool_tmpl_");
+        assert!(builder.migrations_path.is_none());
+        assert!(builder.exclude.is_none());
+        assert!(builder.purge_schemas.is_empty());
+        assert_eq!(builder.fingerprint_salt, None);
+        assert_eq!(builder.clone_strategy, CloneStrategy::WalLog);
+    }
+
+    #[tokio::test]
+    async fn build_or_reuse_template_fails_fast_on_maintenance_connect_errors() {
+        let result =
+            build_or_reuse_template(&dummy_connect_options(), &[], "warmpool_tmpl_", None).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn create_test_database_returns_error_when_connection_target_is_unreachable() {
+        let template = TemplatePoolBuilder::new(dummy_connect_options())
+            .migrations_from("./tests/fixtures/migrations")
+            .build()
+            .await
+            .expect("build should only read file metadata");
+
+        assert!(template.create_test_database().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_database_accessors_and_drop_path_report_error_without_a_live_server() {
+        let db = TestDatabase {
+            pool: PgPool::connect_lazy_with(dummy_connect_options()),
+            name: "warmpool_test_abc".to_string(),
+            maintenance_options: dummy_connect_options(),
+        };
+
+        assert_eq!(db.name(), "warmpool_test_abc");
+        assert!(
+            !db.pool().is_closed(),
+            "lazy pool should still be open before use"
+        );
+        assert!(db.drop_database().await.is_err());
     }
 }

@@ -78,9 +78,44 @@ pub enum Error {
     /// call started, it cannot prevent a brand new connection from racing
     /// in during the (very small) window between this sweep completing and
     /// the `CREATE DATABASE` statement that follows it.
-    #[error("failed to clear stray connections from template `{name}` before cloning")]
+    #[error("failed to clear stray connections from `{name}`")]
     TemplateConnectionSweep {
         name: String,
+        #[source]
+        source: sqlx::Error,
+    },
+
+    /// Fired at the start of `build_template_if_missing()`'s slow path,
+    /// while clearing away a `_building` database left over from a
+    /// previous crashed build attempt at this exact fingerprint.
+    /// Ak illed CI job, an OOM, a migration panicking the process before it
+    /// had a chance to fail cleanly. This cleanup runs unconditionally at
+    /// the start of every fresh build, not just when an orphan is
+    /// suspected: `DROP DATABASE IF EXISTS` against a name that was never
+    /// created is a no-op, so there's no meaningful cost to always trying,
+    /// and skipping it would mean a crashed build permanently blocks every
+    /// future attempt at this fingerprint (`CREATE DATABASE` would keep
+    /// failing with "already exists" against the orphan forever).
+    #[error("failed to clean up a leftover `{name}` from a previous build attempt")]
+    CleanupStaleBuildingDb {
+        name: String,
+        #[source]
+        source: sqlx::Error,
+    },
+
+    /// Fired from `build_template_if_missing()`'s final step: renaming the
+    /// fully migrated `_building` database into its final, fingerprinted
+    /// name. This rename is what makes template construction crash atomic
+    /// as of 0.1.3. there is no window, from Postgres's catalog perspective,
+    /// where a half-migrated database exists under the final name. If this fails, `_building` remains
+    /// under its `_building` name, fully migrated but not yet promoted;
+    /// the next build attempt for this fingerprint finds it via
+    /// `CleanupStaleBuildingDb`'s sweep, drops it, and rebuilds from
+    /// scratch and not try to resume or reuse it.
+    #[error("failed to rename `{from}` to `{to}`")]
+    TemplateRename {
+        from: String,
+        to: String,
         #[source]
         source: sqlx::Error,
     },
