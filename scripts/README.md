@@ -92,7 +92,18 @@ The script creates a partial orphaned `_building` database, executes the cleanup
 
 ***Do not point PGURL at a database containing data you need to preserve and obviously not to a production database***.
 
+Reproducing the trigger purge vulnerability locally (0.1.4)
+------------------------------------------------------------
 
+To reproduce the real destructive case against a live Postgres instance, run the trigger purge demo script:
+
+```bash
+PGURL="postgres://postgres:postgres@127.0.0.1:5432/postgres" ./scripts/reproduce_trigger_purge_vulnerability.sh
+```
+
+The script creates a dedicated demo database with two tenant schemas, creates one trigger in each schema, then runs the old vulnerable purge pattern using the malicious payload `tenant_a' OR '1'='1` and prints the trigger counts before and after. If the bug is present, `tenant_b` loses its trigger even though the schema was never named.
+
+This script is intentionally a reproduction and reporting helper, not a general-purpose maintenance tool. It is designed to be run against a disposable test database and cleans up the demo database automatically on success or failure.
 
 Contact
 -------

@@ -541,21 +541,43 @@ fn rename_database_sql(from: &str, to: &str) -> String {
     format!(r#"ALTER DATABASE "{from}" RENAME TO "{to}";"#)
 }
 
+/// Escape `value` for safe interpolation into a Postgres string literal,
+/// and wrap it in Postgres's "escape string" syntax (`E'...'`) rather
+/// than a plain `'...'` literal. This is deliberate, because
+/// doubling embedded `'` alone is only sufficient when the connected
+/// server has `standard_conforming_strings = on` (the default since
+/// Postgres 9.1, but not something this pure function can check cause it
+/// never touches a connection). Using `E'...'` makes backslash escaping
+/// semantics explicit and independent of that setting, so this will be correct
+/// regardless of how the server is configured. Doubles both `'` (the
+/// literal's delimiter) and `\` (the escape character `E'...'` syntax
+/// gives meaning to), doubling only the former would let a schema name
+/// ending in a backslash re-open the literal via `\'` being read as an
+/// escaped quote rather than a closing one. Bad things happen if a schema name can break
+/// out of the literal and inject arbitrary SQL into the `WHERE nspname = ...` clause of the `purge_triggers_sql()` DO block.
+fn escape_sql_literal(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('\'', "''");
+    format!("E'{escaped}'")
+}
+
 fn drop_database_if_exists_sql(name: &str) -> String {
     format!(r#"DROP DATABASE IF EXISTS "{name}";"#)
 }
 
-/// `schema` is interpolated directly into a single quoted SQL string
-/// literal (`WHERE nspname = '{schema}'`) rather than passed as a bound
-/// parameter, this DO block can't take one, since `EXECUTE format(...)`
-/// only parameterizes the identifiers it formats, not the literal driving
-/// the `WHERE` clause itself. In practice `schema` is a compile-time-ish
-/// config value from [`TemplatePoolBuilder::purge_triggers_in`], not
-/// end-user input, so this hasn't been a practical problem  but it *is*
-/// unescaped, and a schema name containing a `'` breaks out of the
-/// literal. `purge_triggers_sql_does_not_escape_embedded_quotes`
-/// documents this. We are not pretending it isn't there.
+/// `schema` is interpolated into a single quoted SQL string literal
+/// (`WHERE nspname = ...`) rather than passed as a bound parameter,
+/// this DO block can't take one, since `EXECUTE format(...)` only
+/// parameterizes the identifiers it formats, not the literal driving the
+/// `WHERE` clause itself, and anonymous code blocks don't accept `$1`
+/// placeholders at all. `schema` is escaped via [`escape_sql_literal`]
+/// before interpolation, so a schema name containing a `'` or `\` can no
+/// longer break out of the literal. In practice `schema` is a
+/// compile-time-ish config value from [`TemplatePoolBuilder::purge_triggers_in`],
+/// not end-user input, which is the only reason this we consider thid low practical risk gap
+/// not an exploitable one. See `purge_triggers_sql_neutralizes_a_quote_and_semicolon_injection_attempt`
+/// test for what it looks like closed.
 fn purge_triggers_sql(schema: &str) -> String {
+    let schema_literal = escape_sql_literal(schema);
     format!(
         r#"
         DO $$
@@ -563,13 +585,18 @@ fn purge_triggers_sql(schema: &str) -> String {
             r RECORD;
         BEGIN
             FOR r IN
-                SELECT tgname, relname
+                SELECT tgname, relname, nspname AS rel_schema
                 FROM pg_trigger
                 JOIN pg_class ON pg_class.oid = tgrelid
                 JOIN pg_namespace ON pg_namespace.oid = relnamespace
-                WHERE nspname = '{schema}' AND NOT tgisinternal
+                WHERE nspname = {schema_literal} AND NOT tgisinternal
             LOOP
-                EXECUTE format('DROP TRIGGER IF EXISTS %I ON %I CASCADE', r.tgname, r.relname);
+                EXECUTE format(
+                    'DROP TRIGGER IF EXISTS %I ON %I.%I CASCADE',
+                    r.tgname,
+                    r.rel_schema,
+                    r.relname
+                );
             END LOOP;
         END
         $$;
@@ -578,7 +605,7 @@ fn purge_triggers_sql(schema: &str) -> String {
 }
 
 /// Terminate every other backend connected to `datname`. See the block
-/// comment `sweep_and_drop_database` for why this isn't a `*_sql`
+/// comment above this function's siblings for why this isn't a `*_sql`
 /// pure string function like the others.
 async fn terminate_other_backends(
     conn: &mut PgConnection,
@@ -601,7 +628,7 @@ async fn terminate_other_backends(
 /// `DROP DATABASE IF EXISTS` against a name that was never created is a
 /// no-op, so this is always safe to call whether or not `name` actually
 /// exists. Shared between `TestDatabase::drop_database()` and the
-/// leftover-`_building` cleanup in `build_template_if_missing()`. same
+/// leftover-`_building` cleanup in `build_template_if_missing()`, same
 /// two step operation, two different reasons to run it, two different
 /// `Error` variants at the two call sites (mapped by each caller, not
 /// here, same pattern as `terminate_other_backends`).
@@ -764,7 +791,14 @@ mod tests {
             .collect();
         assert_eq!(
             descriptions,
-            vec!["initial", "create widgets", "create gadgets", "seed data"]
+            vec![
+                "initial",
+                "create widgets",
+                "create gadgets",
+                "seed data",
+                "tenants",
+                "create triggers"
+            ]
         );
     }
 
@@ -784,20 +818,19 @@ mod tests {
             .collect();
         assert_eq!(
             descriptions,
-            vec!["initial", "create widgets", "create gadgets"],
+            vec![
+                "initial",
+                "create widgets",
+                "create gadgets",
+                "tenants",
+                "create triggers"
+            ],
             "the excluded migration must not appear in the stored set"
         );
     }
 
     #[tokio::test]
     async fn excluded_migration_is_not_retained_anywhere_on_the_built_pool() {
-        // The previous test already asserts that the excluded migration is not in the
-        // stored set, but this one goes a step further and asserts that it is not
-        // retained anywhere else in the TemplatePool either (e.g. stashed for later
-        // application to test databases). This is important because the excluded
-        // migration is not applied to test databases, so if it were retained anywhere
-        // in the TemplatePool, it could be applied to test databases later, which
-        // would violate the contract of exclude_migration as of 0.1.2.
         let pool = TemplatePoolBuilder::new(dummy_connect_options())
             .migrations_from("./tests/fixtures/migrations")
             .exclude_migration(|m| m.description.contains("seed data"))
@@ -807,7 +840,7 @@ mod tests {
 
         assert_eq!(
             pool.migrations.len(),
-            3,
+            5,
             "only the non excluded migrations are kept"
         );
         assert!(
@@ -825,7 +858,7 @@ mod tests {
             .await
             .expect("build should not touch the network");
 
-        assert_eq!(pool.migrations.len(), 4);
+        assert_eq!(pool.migrations.len(), 6);
     }
 
     #[tokio::test]
@@ -891,24 +924,88 @@ mod tests {
     #[test]
     fn purge_triggers_sql_targets_the_given_schema() {
         let sql = purge_triggers_sql("public");
-        assert!(sql.contains("nspname = 'public'"));
+        assert!(sql.contains("nspname = E'public'"));
         assert!(sql.contains("DROP TRIGGER IF EXISTS"));
     }
 
     #[test]
-    fn purge_triggers_sql_does_not_escape_embedded_quotes() {
-        // Documents current limitation: a schema name containing a single quote breaks out of the string
-        // literal. `schema` comes from TemplatePoolBuilder::purge_triggers_in,
-        // a config value rather than typical end-user input, which is why
-        // this hasn't been and doesn't seem to be a practical problem but the function does not
-        // defend against it, and this test exists so that changes to
-        // purge_triggers_sql don't silently start "fixing" this without it
-        // being a deliberate decision that has undergone review.
-        let sql = purge_triggers_sql("public'; DROP TABLE users;");
+    fn escape_sql_literal_doubles_embedded_single_quotes() {
+        assert_eq!(escape_sql_literal("O'Brien"), "E'O''Brien'");
+    }
+
+    #[test]
+    fn escape_sql_literal_doubles_embedded_backslashes() {
+        assert_eq!(escape_sql_literal(r"a\b"), r"E'a\\b'");
+    }
+
+    #[test]
+    fn escape_sql_literal_handles_a_trailing_backslash_safely() {
+        // The specific edge case that makes escaping only quotes
+        // insufficient once E'...' syntax is in play: a trailing
+        // backslash right before what should be the closing quote. If
+        // the backslash weren't also doubled, `\'` would be read as an
+        // *escaped* quote (string still open), swallowing everything
+        // after it, including the rest of the generated SQL into
+        // the literal.
+        let escaped = escape_sql_literal(r"public\");
+        assert_eq!(
+            escaped, r"E'public\\'",
+            "the trailing backslash must be doubled, if it weren't, \\' \
+             at the end would be read as an escaped quote (string still \
+             open) instead of a backslash followed by the closing quote"
+        );
+    }
+
+    #[test]
+    fn purge_triggers_sql_neutralizes_a_boolean_where_clause_injection() {
+        // The *exploitable* payload shape here.
+        //
+        // Worth being precise about the mechanism, because the obvious
+        // guess and assumption is wrong: a `'; DROP TABLE x; --` style payload does NOT
+        // work against this function. The interpolation point sits inside
+        // a dollar quoted `DO $$ ... $$` body, which Postgres parses as a
+        // single unit, so a stray `;` can't start a new top-level
+        // statement it just produces a syntax error and the whole
+        // block fails loudly.
+        //
+        // What *did* work was widening the WHERE clause instead of
+        // escaping the statement: `tenant_a' OR '1'='1` keeps the SQL
+        // syntactically valid while making the FOR loop iterate over
+        // every non-internal trigger in the database, not just the
+        // requested schema's. Combined with `format('%I')` emitting an
+        // unqualified relation name (so the DROP resolves against
+        // `search_path`), this deleted a trigger in a schema the caller
+        // never named. That's the real severity: not arbitrary statement
+        // execution, but silently purging triggers outside the requested
+        // schema.
+        let payload = "tenant_a' OR '1'='1";
+        let sql = purge_triggers_sql(payload);
+
         assert!(
-            sql.contains("nspname = 'public'; DROP TABLE users;'"),
-            "current behavior: the quote is not escaped and breaks out of the literal \
-             (this assertion is intentionally documenting the gap, not endorsing it)"
+            sql.contains(r#"nspname = E'tenant_a'' OR ''1''=''1'"#),
+            "the payload must be contained in one escaped literal so it can \
+             only ever match a (nonexistent) schema with that literal name, \
+             never widen the WHERE clause: got {sql}"
+        );
+        assert!(
+            !sql.contains("nspname = E'tenant_a' OR '1'='1'"),
+            "the broken-out form, where OR becomes live SQL, must not appear"
+        );
+    }
+
+    #[test]
+    fn purge_triggers_sql_neutralizes_a_backslash_based_injection_attempt() {
+        // A payload shaped to exploit E'...' syntax's
+        // backslash escaping if only quotes were doubled: a trailing
+        // backslash intended to escape the literal's closing quote so the
+        // string stays open and the rest of the payload becomes live SQL.
+        let payload = r"tenant_a\' OR '1'='1";
+        let sql = purge_triggers_sql(payload);
+
+        let expected_literal_body = payload.replace('\\', "\\\\").replace('\'', "''");
+        assert!(
+            sql.contains(&format!("nspname = E'{expected_literal_body}'")),
+            "payload must be fully contained in one escaped literal: got {sql}"
         );
     }
 

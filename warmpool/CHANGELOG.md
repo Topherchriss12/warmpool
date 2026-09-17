@@ -102,3 +102,42 @@ In development the cleanup, rebuild, and rename flow was validated against a liv
 No breaking changes.
 
 No new dependencies. This release fixes a bug.
+
+
+## 0.1.4
+
+### Fixed
+
+- **`purge_triggers_sql` interpolated the schema name into a SQL string literal without escaping**. `TemplatePoolBuilder::purge_triggers_in(schema)` now escapes `schema` via a new internal `escape_sql_literal()` helper before interpolation, and wraps it in Postgres's `E'...'` escape string syntax instead of a plain `'...'` literal.
+
+The originally we described this as "low practical risk" and illustrated it with a `'; DROP TABLE users; --` style payload. Testing the actual exploit against a real Postgres instance before writing the fix showed **both halves of that framing were wrong**, in opposite directions:
+
+- **The statement injection payload doesn't work at all.** The interpolation point sits inside a dollar quoted `DO $$ ... $$` body, which Postgres parses as a single unit. A stray `;` can't start a new top-level statement it just produces `ERROR: missing "LOOP" at end of SQL expression` and the whole block fails loudly. The target table was still there afterward. So the scary looking payload in the original assesment and write up was never actually achievable.
+
+- **A different payload shape *is* achievable, and it's worse than "low practical risk."** Widening the `WHERE`
+  clause instead of escaping the statement `tenant_a' OR '1'='1` keeps the SQL syntactically valid while making the loop iterate over *every* non-internal trigger in the database rather than just the named schema's. Combined with `format('%I')` emitting an unqualified relation name (so the generated `DROP TRIGGER` resolves through `search_path`), this **actually deleted a trigger belonging to a schema the caller never named.** Reproduced end-to-end against a real instance: with two tenant schemas each holding one trigger, calling the vulnerable code for `tenant_a` with that payload destroyed `tenant_b`'s trigger.
+
+  The correct characterization is therefore not "arbitrary SQL execution" (impossible here) and not "low practical risk" (demonstrably destructive), but: **silent, out-of-scope trigger destruction in schemas the caller never named.** Still requires a hostile or malformed value reaching `purge_triggers_in()`, which remains a developer supplied config value not a runtime input.
+
+### Why `E'...'` and not just doubling quotes
+
+Doubling embedded `'` alone is only sufficient when the server has `standard_conforming_strings = on` (the default since Postgres 9.1, but not something a pure string building function can verify for it never touches a connection). `E'...'` makes backslash escaping semantics explicit and server config independent. That in turn means `\` must be doubled too, not just `'`: a value ending in a backslash would otherwise let `\'` be read as an *escaped* quote instead of a closing one, re-opening the literal and swallowing the rest of the generated SQL. Covered by `escape_sql_literal_handles_a_trailing_backslash_safely`.
+
+### Added
+
+- `escape_sql_literal()`; internal helper, doubles both `'` and `\` and wraps in `E'...'`.
+- unit tests: `escape_sql_literal_doubles_embedded_single_quotes`, `escape_sql_literal_doubles_embedded_backslashes`, `escape_sql_literal_handles_a_trailing_backslash_safely`, and `purge_triggers_sql_neutralizes_a_boolean_where_clause_injection` (which replaces the old `purge_triggers_sql_does_not_escape_embedded_quotes` gap documenting test). Plus `purge_triggers_sql_neutralizes_a_backslash_based_injection_attempt`.
+- Two new integration tests, and a added to the migrations fixture two schemas, one trigger each:
+  - `test_purge_triggers_in_cannot_escape_its_schema_via_a_malicious_name` - drives the malicious schema name through the ordinary public API and asserts both tenants' triggers survive.
+  - `test_purge_triggers_in_still_purges_exactly_the_named_schema` - the non-adversarial half, asserting a legitimate schema name still purges exactly that schema and leaves the other alone. Without this, the test above could pass trivially if the fix had accidentally turned `purge_triggers_in` into a no-op.
+
+
+### Verification
+
+We reproduced this vulnerability against a real Postgres instance before the fix (two tenant schemas, one trigger each; the boolean payload plus a `search_path` pointing at the unnamed schema destroyed that schema's trigger), and the same payload was then confirmed inert against the fixed code (both triggers survive). The `'; DROP TABLE --` non-exploit was also confirmed directly. As with prior releases, the Rust level suite runs against a minimal `sqlx` stand in for type and logic correctness; the Postgres level behavioral claims above are what the direct verification covers.
+
+### Compatibility
+
+No breaking changes.
+
+No new dependencies. This release fixes a bug.

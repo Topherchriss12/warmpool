@@ -21,11 +21,11 @@ Four things determine where an item sits in the sequence below, roughly in this 
 |---|---|---|---|---|
 | 1 | No stale connection sweep on the template before cloning | **Resolved** | 0.1.2 | Bug fix |
 | 2 | Template construction isn't crash atomic | **Resolved** | 0.1.3 | Bug fix |
-| 3 | `purge_triggers_sql` doesn't escape the schema literal | Open | 0.1.4 | Bug fix |
+| 3 | `purge_triggers_sql` doesn't escape the schema literal | **Resolved** | 0.1.4 | Bug fix |
 | 4 | `create_test_database_sql` doesn't escape the template prefix identifier | Open | 0.1.5 | Bug fix |
 | 5 | `exclude_migration`'s actual behavior may not be the behavior it appears to be, atleast for now | Open | pending | Design decision |
 
-One item "Resolved" four to go. This table is the first thing that changes when something is.
+Three items "Resolved" 2 to go. This table is the first thing that changes when something is.
 
 ---
 
@@ -97,7 +97,7 @@ Does a later build attempt clean it up, or does it need its own explicit handlin
 
 ### 3. `purge_triggers_sql` doesn't escape the schema literal
 
-**Status:** Open · **Target:** 0.1.4 · Practical risk is low, but it's a real defect.
+**Status:** Resolved · **Target:** 0.1.4 · Practical risk is low, but it's a real defect.
 
 **What's broken:** `TemplatePoolBuilder::purge_triggers_in(schema)` interpolates `schema` directly into a single quoted SQL string literal inside a `DO $$ ... $$` block:
 
@@ -114,7 +114,7 @@ is the only reason this hasn't been a real-world problem. It's still unescaped, 
 **Planned fix:** escape `schema` before interpolation (double any embedded `'`), or switch to Postgres's `quote_literal()` inside the generated SQL rather than doing string escaping in Rust. Replace the
 test that currently documents the gap with one asserting the previously vulnerable input is now handled safely.
 
-**Tracking:** to be filed as its own issue.
+**Tracking:** was filed as its own issue before work began.
 
 ---
 
@@ -159,6 +159,27 @@ link once it exists.
 ---
 
 ## Resolved
+
+### 3. `purge_triggers_sql` doesn't escape the schema literal
+ 
+**Resolved in:** 0.1.4
+ 
+`TemplatePoolBuilder::purge_triggers_in(schema)` interpolated `schema` directly into a single quoted SQL string literal inside a `DO $$ ... $$` block, unescaped.
+ 
+**The fix:** a new internal `escape_sql_literal()` helper that doubles both `'` and `\` and wraps the result in Postgres's `E'...'` escape string syntax. `E'...'` instead of a plain literal because doubling quotes alone is only sufficient when the server has `standard_conforming_strings = on`, the default since Postgres 9.1, but
+not something a pure string-building function can check, since it never
+touches a connection. Using `E'...'` makes the semantics explicit and config independent, which is also *why* `\` has to be doubled, otherwise a value ending in a backslash lets `\'` read as an escaped quote instead of a 
+closing one.
+ 
+- **This entry's original severity description when we first discovered was underestimated**; we labeled it "low 
+    practical risk" and illustrated with a `'; DROP TABLE users; --` payload. Testing the real exploit against a real Postgres instance before writing the fix showed: The interpolation point is inside a dollar quoted `DO $$ ... $$` body, which Postgres parses as a single unit; a stray `;` can't start a new top level statement, it just produces `ERROR: missing "LOOP" at end of SQL expression`. Verified the target table was untouched afterward. A different payload shape works and is genuinely destructive. Widening the `WHERE` clause rather than escaping the statement (`tenant_a' OR '1'='1`) keeps the SQL valid while making the loop iterate over every non-internal trigger in the database. 
+
+    Because `format('%I')` emits an *unqualified* relation name, the generated `DROP TRIGGER` resolves through `search_path`, so with two tenant schemas each holding a trigger, purging `tenant_a` with that payload **destroyed `tenant_b`'s trigger.** Reproduced end to end, then confirmed inert against the fix.
+    The accurate characterization is neither "arbitrary SQL execution" (impossible through this code path) nor "low practical risk" (demonstrably destructive), but **silent, out-of-scope trigger destruction in schemas the caller never named**. It still required a hostile or malformed value reaching `purge_triggers_in()`, a developer supplied config value, not runtime input , which is the part of the original assessment that holds up, and why we kept this ranked third.
+ 
+**[ISSUE#3](https://github.com/Topherchriss12/warmpool/issues/3#issue-5451445887)**
+ 
+---
 
  
 ### 2. Template construction isn't crash-atomic

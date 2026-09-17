@@ -1,4 +1,4 @@
-use sqlx::{Connection, PgPool};
+use sqlx::{Connection, Executor, PgPool};
 use std::time::Instant;
 use testcontainers::clients::Cli;
 use testcontainers_modules::postgres::Postgres;
@@ -841,24 +841,25 @@ async fn test_excluded_migration_is_absent_from_both_template_and_test_database(
     db.drop_database().await.ok();
 }
 
-/// A crash mid-migration (a killed CI job, an OOM, a migration panicking the
-/// process) leaves a half migrated database sitting under the
-/// template's final, fingerprinted name and the existence check in
+/// SHARP_EDGES.md #2: template construction wasn't crash-atomic. A crash
+/// mid-migration (a killed CI job, an OOM, a migration panicking the
+/// process) used to leave a half-migrated database sitting under the
+/// template's final, fingerprinted name -- and the existence check in
 /// `build_template_if_missing()` had no way to distinguish that from a
-/// genuinely finished template prior to 0.1.3, so every clone afterward silently got a
+/// genuinely finished template, so every clone afterward silently got a
 /// broken schema.
 ///
-/// There's no way to literally kill a process mid migration from inside a
+/// There's no way to literally kill a process mid-migration from inside a
 /// single test function and have anything left to assert against
-/// afterward (we have tried), so this test constructs the *end state* a crash would leave
+/// afterward, so this test constructs the *end state* a crash would leave
 /// behind directly: a `_building` database that exists and has some, but
 /// not all, of the migrations applied, with the final name not existing
-/// at all bypassing the public API entirely to build it, the same way
-/// `warmpool::fingerprint` is used elsewhere to reconstruct
+/// at all -- bypassing the public API entirely to build it, the same way
+/// `warmpool::fingerprint` is used elsewhere in this file to reconstruct
 /// names without reaching into anything private. Then it drives a
 /// completely ordinary `create_test_database()` call for that exact
 /// fingerprint and confirms the orphan gets cleaned up and a fresh,
-/// *complete* template gets built, not that the half built one is
+/// *complete* template gets built -- not that the half-built one is
 /// somehow resumed or reused.
 #[tokio::test]
 // #[ignore]
@@ -881,14 +882,14 @@ async fn test_orphaned_building_database_is_cleaned_up_and_rebuilt() {
 
     // Build the orphan directly: a `_building` database with only the
     // *first* migration applied (`users`, no `widgets`/`gadgets`/seed
-    // data), and never renamed, exactly what a crash right after the
+    // data), and never renamed -- exactly what a crash right after the
     // first migration committed, but before the second one ran, would
     // leave behind.
     let mut maintenance = sqlx::postgres::PgConnection::connect_with(&connect_options)
         .await
         .expect("failed to open a maintenance connection for test setup");
-    sqlx::query(&format!(r#"CREATE DATABASE "{building_name}""#))
-        .execute(&mut maintenance)
+    maintenance
+        .execute(format!(r#"CREATE DATABASE "{building_name}""#).as_str())
         .await
         .expect("test setup: failed to create the simulated orphan _building database");
 
@@ -896,13 +897,13 @@ async fn test_orphaned_building_database_is_cleaned_up_and_rebuilt() {
     let mut building_conn = sqlx::postgres::PgConnection::connect_with(&building_opts)
         .await
         .expect("test setup: failed to connect to the simulated orphan");
-    sqlx::raw_sql(migrations[0].sql.as_ref())
-        .execute(&mut building_conn)
+    building_conn
+        .execute(migrations[0].sql.as_ref())
         .await
         .expect("test setup: failed to apply the first migration to the simulated orphan");
     drop(building_conn);
 
-    // Confirm the test setup actually produced the state we think it should and did,
+    // Confirm the test setup actually produced the state we think it did,
     // before making any claim about what warmpool does with it.
     let orphan_exists: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)")
@@ -927,7 +928,7 @@ async fn test_orphaned_building_database_is_cleaned_up_and_rebuilt() {
     );
 
     // Now drive a completely ordinary create_test_database() call for
-    // this exact fingerprint. Before, build_template_if_missing()
+    // this exact fingerprint. Before this fix, build_template_if_missing()
     // would have tried `CREATE DATABASE "{template_name}"` directly and
     // this test would still be sitting on the orphan; there was nothing
     // here to detect or clean it up.
@@ -944,9 +945,9 @@ async fn test_orphaned_building_database_is_cleaned_up_and_rebuilt() {
          \"database already exists\" against the orphan forever",
     );
 
-    // The clone must have the full schema, all four migrations, not
-    // just the one the orphan happened to have, proving a genuine fresh
-    // rebuild happened and the half built orphan was not resumed,
+    // The clone must have the FULL schema -- all four migrations, not
+    // just the one the orphan happened to have -- proving a genuine fresh
+    // rebuild happened rather than the half-built orphan being resumed,
     // patched, or reused as-is.
     for table in ["users", "widgets", "gadgets"] {
         let exists: bool = sqlx::query_scalar(&format!(
@@ -962,7 +963,7 @@ async fn test_orphaned_building_database_is_cleaned_up_and_rebuilt() {
         );
     }
 
-    // The orphan is gone, dropped during cleanup, its replacement
+    // The orphan is gone -- dropped during cleanup, its replacement
     // consumed by the rename into the final name. Nothing should be
     // left sitting under the `_building` suffix.
     let building_still_exists: bool =
@@ -1046,4 +1047,118 @@ async fn test_template_is_reusable_normally_after_orphan_recovery() {
     );
 
     second.drop_database().await.ok();
+}
+
+///  `purge_triggers_in(schema)` used to interpolate `schema` unescaped into a SQL string literal. This test drives the
+/// fixed code through the ordinary public API with a malicious schem name and confirms it can no longer reach triggers
+/// outside the schema  it names.
+///
+/// On the actual exploit,  a `'; DROP TABLE x; --` payload does **not**
+/// work against this code path. The interpolation point sits inside a
+/// dollar quoted `DO $$ ... $$` body, which Postgres parses as one unit,
+/// so a stray `;` only produces a syntax error.
+#[tokio::test]
+// #[ignore]
+async fn test_purge_triggers_in_cannot_escape_its_schema_via_a_malicious_name() {
+    let salt = format!("purge_injection_{}", uuid::Uuid::new_v4());
+    let url = shared_postgres_url().await;
+    let connect_options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+
+    // A schema name crafted to widen the WHERE clause if it were
+    // interpolated unescaped. There is no real schema by this name, the
+    // whole point is that after the fix it's treated as one inert literal
+    // that simply matches nothing.
+    let malicious_schema = "tenant_a' OR '1'='1";
+
+    let template = TemplatePool::builder(connect_options)
+        .migrations_from("./tests/fixtures/migrations")
+        .fingerprint_salt(salt)
+        .purge_triggers_in(malicious_schema)
+        .build()
+        .await
+        .expect("failed to build template pool");
+
+    let db = template.create_test_database().await.expect(
+        "a malicious schema name must not break the clone -- it should \
+                 simply match no schema and purge nothing",
+    );
+
+    // Both triggers must survive. Before the fix, the widened WHERE
+    // clause matched both, and (depending on search_path) could actually
+    // drop one of them.
+    let surviving: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_trigger
+         JOIN pg_class ON pg_class.oid = tgrelid
+         JOIN pg_namespace ON pg_namespace.oid = relnamespace
+         WHERE NOT tgisinternal AND nspname IN ('tenant_a', 'tenant_b')",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("failed to count surviving triggers");
+
+    assert_eq!(
+        surviving, 2,
+        "both tenant triggers must survive: a schema name that matches no \
+         real schema must purge nothing at all, not widen the WHERE clause \
+         into matching every trigger in the database"
+    );
+
+    db.drop_database().await.ok();
+}
+
+/// The ordinary, non adversarial half of the same behavior: is a legitimate
+/// schema name still purges exactly that schema's triggers and nothing
+/// else. Without this, the test above could pass trivially if this fix had
+/// broken `purge_triggers_in` into a permanent no-op.
+#[tokio::test]
+// #[ignore]
+async fn test_purge_triggers_in_still_purges_exactly_the_named_schema() {
+    let salt = format!("purge_scoped_{}", uuid::Uuid::new_v4());
+    let url = shared_postgres_url().await;
+    let connect_options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+
+    let template = TemplatePool::builder(connect_options)
+        .migrations_from("./tests/fixtures/migrations")
+        .fingerprint_salt(salt)
+        .purge_triggers_in("tenant_a")
+        .build()
+        .await
+        .expect("failed to build template pool");
+
+    let db = template
+        .create_test_database()
+        .await
+        .expect("failed to create test db");
+
+    let tenant_a_triggers: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_trigger
+         JOIN pg_class ON pg_class.oid = tgrelid
+         JOIN pg_namespace ON pg_namespace.oid = relnamespace
+         WHERE NOT tgisinternal AND nspname = 'tenant_a'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+
+    let tenant_b_triggers: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_trigger
+         JOIN pg_class ON pg_class.oid = tgrelid
+         JOIN pg_namespace ON pg_namespace.oid = relnamespace
+         WHERE NOT tgisinternal AND nspname = 'tenant_b'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+
+    assert_eq!(
+        tenant_a_triggers, 0,
+        "the named schema's triggers must actually be purged -- the fix must \
+         not have turned purge_triggers_in into a no-op"
+    );
+    assert_eq!(
+        tenant_b_triggers, 1,
+        "a schema that wasn't named must be left completely alone"
+    );
+
+    db.drop_database().await.ok();
 }
