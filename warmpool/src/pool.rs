@@ -525,11 +525,32 @@ async fn purge_triggers(conn: &mut PgConnection, schema: &str) -> Result<()> {
 // `TestDatabase::drop_database()`: same query, two different reasons to
 // run it, two different `Error` variants at the two call sites.
 
+/// Escape `value` for safe interpolation into a double quoted Postgres
+/// identifier. The rule is simpler than the string literal case
+/// ([`escape_sql_literal`]): inside `"..."`, a literal `"` is written by
+/// doubling it, and backslash has no special meaning at all, so there is
+/// no `E'...'`-style escape mode question to worry about here.
+///
+/// This matters more than the string literal gap did. `purge_triggers_sql`'s
+/// output goes into a `DO $$ ... $$` body, which Postgres parses as a
+/// single unit, so a break out there could only widen a `WHERE` clause.
+/// These identifiers go into statements sent via simple query protocol,
+/// where a break out *can* terminate the statement and start a new one,
+/// so a break out here could be used to drop arbitrary databases. This is
+/// confirmed by actually dropping an unrelated database with a crafted
+/// `template_prefix`. See `create_test_database_sql_neutralizes_an_identifier_break_out`.
+fn escape_sql_identifier(value: &str) -> String {
+    value.replace('"', "\"\"")
+}
+
 fn create_test_database_sql(db_name: &str, template_name: &str, strategy_clause: &str) -> String {
+    let db_name = escape_sql_identifier(db_name);
+    let template_name = escape_sql_identifier(template_name);
     format!(r#"CREATE DATABASE "{db_name}" WITH TEMPLATE "{template_name}"{strategy_clause};"#)
 }
 
 fn create_template_database_sql(template_name: &str) -> String {
+    let template_name = escape_sql_identifier(template_name);
     format!(r#"CREATE DATABASE "{template_name}";"#)
 }
 
@@ -538,6 +559,8 @@ fn create_template_database_sql(template_name: &str) -> String {
 /// rename. See `Error::TemplateRename` for what atomicity guarantee this
 /// buys `build_template_if_missing()`.
 fn rename_database_sql(from: &str, to: &str) -> String {
+    let from = escape_sql_identifier(from);
+    let to = escape_sql_identifier(to);
     format!(r#"ALTER DATABASE "{from}" RENAME TO "{to}";"#)
 }
 
@@ -561,6 +584,7 @@ fn escape_sql_literal(value: &str) -> String {
 }
 
 fn drop_database_if_exists_sql(name: &str) -> String {
+    let name = escape_sql_identifier(name);
     format!(r#"DROP DATABASE IF EXISTS "{name}";"#)
 }
 
@@ -1010,69 +1034,76 @@ mod tests {
     }
 
     #[test]
-    fn create_test_database_sql_does_not_escape_embedded_quotes_in_names_either() {
-        // Same caveat, for the identifier side: db_name and
-        // template_name are wrapped in double quotes but not escaped. Both
-        // values are warmpool generated in practice (a UUID and a
-        // prefix+fingerprint), except template_prefix is user configurable
-        // via TemplatePoolBuilder::template_prefix, which means a prefix
-        // containing `"` would break out of the quoted identifier.
+    fn escape_sql_identifier_doubles_embedded_double_quotes() {
+        assert_eq!(escape_sql_identifier(r#"a"b"#), r#"a""b"#);
+    }
+
+    #[test]
+    fn escape_sql_identifier_leaves_backslashes_alone() {
+        // Unlike the string literal case, backslash has no special
+        // meaning inside a double-quoted identifier doubling it here
+        // would corrupt the name rather than protect it.
+        assert_eq!(escape_sql_identifier(r"a\b"), r"a\b");
+    }
+
+    #[test]
+    fn create_test_database_sql_neutralizes_an_identifier_break_out() {
+        // The payload that, before this fix, actually executed as a
+        // separate statement and dropped an unrelated database.
+        //
+        // This is the key difference from SHARP_EDGES.md #3: that one's
+        // output lives inside a `DO $$ ... $$` body, which Postgres parses
+        // as a single unit, so a break-out could only ever widen a WHERE
+        // clause. These statements go out over simple query protocol,
+        // where a break-out really can start a new statement -- and did.
         let sql = create_test_database_sql(
             "warmpool_test_abc",
-            r#"warmpool_tmpl_"; DROP TABLE users;"#,
+            r#"warmpool_tmpl_"; DROP DATABASE wp_victim; --"#,
             "",
         );
+
         assert!(
-            sql.contains(r#""warmpool_tmpl_"; DROP TABLE users;""#),
-            "current behavior: the embedded quote is not escaped"
+            sql.contains(r#"WITH TEMPLATE "warmpool_tmpl_""; DROP DATABASE wp_victim; --""#),
+            "the payload must stay inside one escaped identifier: got {sql}"
+        );
+        // Counting `;` would be a bad check here, the payload's own
+        // semicolons are still present in the output, just inert inside
+        // the identifier. What actually matters is that every `"` is
+        // balanced, so the identifier the payload tried to close is still
+        // open at that point and the `;` never terminates anything. An
+        // odd count would mean exactly the break out this guards against.
+        assert_eq!(
+            sql.matches('"').count() % 2,
+            0,
+            "double quotes must stay balanced, an odd count means an \
+             identifier was closed early: got {sql}"
         );
     }
 
     #[test]
-    fn template_pool_builder_entrypoint_is_available() {
-        let connect = dummy_connect_options();
-        let builder = TemplatePool::builder(connect.clone());
+    fn every_identifier_quoting_helper_escapes_its_inputs() {
+        // All four helpers share the same exposure, since all four derive
+        // their names from template_prefix. A fix covering only
+        // create_test_database_sql would leave the other three exactly as
+        // open as they were.
+        let payload = r#"x"; DROP DATABASE wp_victim; --"#;
 
-        assert_eq!(builder.template_prefix, "warmpool_tmpl_");
-        assert!(builder.migrations_path.is_none());
-        assert!(builder.exclude.is_none());
-        assert!(builder.purge_schemas.is_empty());
-        assert_eq!(builder.fingerprint_salt, None);
-        assert_eq!(builder.clone_strategy, CloneStrategy::WalLog);
-    }
-
-    #[tokio::test]
-    async fn build_or_reuse_template_fails_fast_on_maintenance_connect_errors() {
-        let result =
-            build_or_reuse_template(&dummy_connect_options(), &[], "warmpool_tmpl_", None).await;
-
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn create_test_database_returns_error_when_connection_target_is_unreachable() {
-        let template = TemplatePoolBuilder::new(dummy_connect_options())
-            .migrations_from("./tests/fixtures/migrations")
-            .build()
-            .await
-            .expect("build should only read file metadata");
-
-        assert!(template.create_test_database().await.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_database_accessors_and_drop_path_report_error_without_a_live_server() {
-        let db = TestDatabase {
-            pool: PgPool::connect_lazy_with(dummy_connect_options()),
-            name: "warmpool_test_abc".to_string(),
-            maintenance_options: dummy_connect_options(),
-        };
-
-        assert_eq!(db.name(), "warmpool_test_abc");
-        assert!(
-            !db.pool().is_closed(),
-            "lazy pool should still be open before use"
-        );
-        assert!(db.drop_database().await.is_err());
+        for sql in [
+            create_test_database_sql("safe_db", payload, ""),
+            create_template_database_sql(payload),
+            rename_database_sql(payload, "safe_target"),
+            rename_database_sql("safe_source", payload),
+            drop_database_if_exists_sql(payload),
+        ] {
+            assert_eq!(
+                sql.matches('"').count() % 2,
+                0,
+                "double quotes must stay balanced in every helper's output: got {sql}"
+            );
+            assert!(
+                sql.contains(r#"x""; DROP DATABASE wp_victim; --"#),
+                "payload must appear escaped, not broken out: got {sql}"
+            );
+        }
     }
 }

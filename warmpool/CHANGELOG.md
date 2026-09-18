@@ -110,7 +110,7 @@ No new dependencies. This release fixes a bug.
 
 - **`purge_triggers_sql` interpolated the schema name into a SQL string literal without escaping**. `TemplatePoolBuilder::purge_triggers_in(schema)` now escapes `schema` via a new internal `escape_sql_literal()` helper before interpolation, and wraps it in Postgres's `E'...'` escape string syntax instead of a plain `'...'` literal.
 
-The originally we described this as "low practical risk" and illustrated it with a `'; DROP TABLE users; --` style payload. Testing the actual exploit against a real Postgres instance before writing the fix showed **both halves of that framing were wrong**, in opposite directions:
+Originally we described this as "low practical risk" and illustrated it with a `'; DROP TABLE users; --` style payload. Testing the actual exploit against a real Postgres instance before writing the fix showed **both halves of that framing were wrong**, in opposite directions:
 
 - **The statement injection payload doesn't work at all.** The interpolation point sits inside a dollar quoted `DO $$ ... $$` body, which Postgres parses as a single unit. A stray `;` can't start a new top-level statement it just produces `ERROR: missing "LOOP" at end of SQL expression` and the whole block fails loudly. The target table was still there afterward. So the scary looking payload in the original assesment and write up was never actually achievable.
 
@@ -135,6 +135,40 @@ Doubling embedded `'` alone is only sufficient when the server has `standard_con
 ### Verification
 
 We reproduced this vulnerability against a real Postgres instance before the fix (two tenant schemas, one trigger each; the boolean payload plus a `search_path` pointing at the unnamed schema destroyed that schema's trigger), and the same payload was then confirmed inert against the fixed code (both triggers survive). The `'; DROP TABLE --` non-exploit was also confirmed directly. As with prior releases, the Rust level suite runs against a minimal `sqlx` stand in for type and logic correctness; the Postgres level behavioral claims above are what the direct verification covers.
+
+### Compatibility
+
+No breaking changes.
+
+No new dependencies. This release fixes a bug.
+
+
+## 0.1.5
+
+### Fixed
+
+- **Identifier interpolation was unescaped across every database name building helper** . `template_prefix` is caller supplied and flows into every database name warmpool constructs. A prefix containing `"` closed the quoted identifier, terminated warmpool's own statement, and started a new one. All four helpers `create_test_database_sql`, `create_template_database_sql`, `rename_database_sql`, and `drop_database_if_exists_sql` now escape their inputs through a new `escape_sql_identifier()`.
+
+### This one was materially worse than #3, and the difference is structural
+
+#3 and #4 looked like siblings "the other unescaped interpolation" but they are not the same severity, and here is the reason why:
+
+- **#3's payload lives inside a `DO $$ ... $$` body**, which Postgres parses as a single unit. A `;` there cannot start a new statement; the worst achievable outcome was widening a `WHERE` clause.
+- **#4's payloads go out as ordinary statements over simple query protocol**, where a `;` genuinely does terminate one statement and begin the next.
+
+Aganist a local postgres instance, the unescaped code, a `template_prefix` of `wp_evil_"; DROP DATABASE wp_victim; --` produced a statement that **dropped `wp_victim`**  a database with no relationship to warmpool at all. Re-run against the fix, the same payload leaves it intact, and Postgres reports the whole thing as one (nonexistent) template *name*: `template database "evil"; DROP DATABASE wp_victim; --" does not exist`.
+
+So the accurate label for this bug is **arbitrary SQL execution**, not the "low practical risk" the entry inherited. The mitigating factor is unchanged `template_prefix` is developer supplied config, not runtime input  which is why it stayed ranked fourth.
+
+### Why the escaping rule differs from #3's
+
+Inside a double quoted identifier, `"` is escaped by doubling it, and **backslash has no special meaning at all**. There is no `E'...'`-style escape-mode question, and doubling backslashes here would corrupt names rather than protect them.
+
+### Added
+
+- `escape_sql_identifier()`; internal helper, doubles `"`, leaves everything else alone.
+- new unit tests, replacing the `create_test_database_sql_does_not_escape_embedded_quotes_in_names_either` gap documenting test: `escape_sql_identifier_doubles_embedded_double_quotes`, `escape_sql_identifier_leaves_backslashes_alone`, `create_test_database_sql_neutralizes_an_identifier_break_out`, and `every_identifier_quoting_helper_escapes_its_inputs` (which covers all four helpers, since a fix covering only one would leave the others equally open).
+- Two integration tests: `test_malicious_template_prefix_cannot_execute_a_second_statement` (drives the real payload through the public API and asserts a bystander database survives) and `test_ordinary_custom_template_prefix_still_works` defensivley so the first can't pass trivially by `template_prefix` having been broken outright.
 
 ### Compatibility
 

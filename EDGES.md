@@ -22,10 +22,10 @@ Four things determine where an item sits in the sequence below, roughly in this 
 | 1 | No stale connection sweep on the template before cloning | **Resolved** | 0.1.2 | Bug fix |
 | 2 | Template construction isn't crash atomic | **Resolved** | 0.1.3 | Bug fix |
 | 3 | `purge_triggers_sql` doesn't escape the schema literal | **Resolved** | 0.1.4 | Bug fix |
-| 4 | `create_test_database_sql` doesn't escape the template prefix identifier | Open | 0.1.5 | Bug fix |
+| 4 | `create_test_database_sql` doesn't escape the template prefix identifier | **Reolved** | 0.1.5 | Bug fix |
 | 5 | `exclude_migration`'s actual behavior may not be the behavior it appears to be, atleast for now | Open | pending | Design decision |
 
-Three items "Resolved" 2 to go. This table is the first thing that changes when something is.
+Four items **Resolved**. This table is the first thing that changes when something is.
 
 ---
 
@@ -134,7 +134,7 @@ containing a `"` breaks out of the quoted identifier. Same practical risk profil
 **Planned fix:** escape `template_prefix` at the point `TemplatePoolBuilder::template_prefix()` is called, or apply Postgres identifier quoting rules (double any embedded `"`) when constructing the SQL. 
 Replace the documenting test with one asserting safe handling.
 
-**Tracking:** to be filed as its own issue, after #3 to keep the two escaping fixes reviewable independently not as a pair.
+**Tracking:** was filed as its own issue after #3 to keep the two escaping fixes reviewable independently not as a pair.
 
 ---
 
@@ -159,6 +159,26 @@ link once it exists.
 ---
 
 ## Resolved
+ 
+### 4. Identifier interpolation is unescaped across all name-building helpers
+ 
+**Resolved in:** 0.1.5
+ 
+`template_prefix` is caller supplied and flows into every database name warmpool builds. A prefix containing `"` closed the quoted identifier, terminated warmpool's statement, and started a new one.
+ 
+**The fix:** `escape_sql_identifier()` (doubles `"`; leaves backslash alone, since it has no special meaning inside `"..."`), applied to all four helpers `create_test_database_sql`, `create_template_database_sql`,
+`rename_database_sql`, and `drop_database_if_exists_sql`. The fourth wasn't in this entry's original scope; it has the same exposure and would have been left open by a narrower fix.
+ 
+**This entry's inherited severity was wrong too, in the opposite direction from #3's.** In fact this was
+**real arbitrary SQL execution** strictly worse than #3 and the difference is structural, not incidental:
+ 
+- #3's payload sits inside a `DO $$ ... $$` body, parsed as one unit. A `;` cannot start a new statement there; the ceiling was a widened `WHERE` clause.
+
+- #4's payloads go out as ordinary statements over simple query protocol, where a `;` genuinely does begin the next statement. With the unescaped code, a `template_prefix` of `wp_evil_"; DROP DATABASE wp_victim; --` **dropped `wp_victim`**, a database unrelated to warmpool. Against the fix the same payload is inert, and Postgres reports it as one nonexistent template *name*:
+`template database "evil"; DROP DATABASE wp_victim; --" does not exist`.
+
+**[ISSUE#4](https://github.com/Topherchriss12/warmpool/issues/4#issue-5494615289)**
+
 
 ### 3. `purge_triggers_sql` doesn't escape the schema literal
  

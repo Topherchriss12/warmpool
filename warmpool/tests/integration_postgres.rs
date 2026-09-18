@@ -841,10 +841,10 @@ async fn test_excluded_migration_is_absent_from_both_template_and_test_database(
     db.drop_database().await.ok();
 }
 
-/// SHARP_EDGES.md #2: template construction wasn't crash-atomic. A crash
+/// template construction wasn't crash-atomic. A crash
 /// mid-migration (a killed CI job, an OOM, a migration panicking the
 /// process) used to leave a half-migrated database sitting under the
-/// template's final, fingerprinted name -- and the existence check in
+/// template's final, fingerprinted name and the existence check in
 /// `build_template_if_missing()` had no way to distinguish that from a
 /// genuinely finished template, so every clone afterward silently got a
 /// broken schema.
@@ -854,12 +854,12 @@ async fn test_excluded_migration_is_absent_from_both_template_and_test_database(
 /// afterward, so this test constructs the *end state* a crash would leave
 /// behind directly: a `_building` database that exists and has some, but
 /// not all, of the migrations applied, with the final name not existing
-/// at all -- bypassing the public API entirely to build it, the same way
+/// at all bypassing the public API entirely to build it, the same way
 /// `warmpool::fingerprint` is used elsewhere in this file to reconstruct
 /// names without reaching into anything private. Then it drives a
 /// completely ordinary `create_test_database()` call for that exact
 /// fingerprint and confirms the orphan gets cleaned up and a fresh,
-/// *complete* template gets built -- not that the half-built one is
+/// *complete* template gets built not that the half-built one is
 /// somehow resumed or reused.
 #[tokio::test]
 // #[ignore]
@@ -1159,6 +1159,107 @@ async fn test_purge_triggers_in_still_purges_exactly_the_named_schema() {
         tenant_b_triggers, 1,
         "a schema that wasn't named must be left completely alone"
     );
+
+    db.drop_database().await.ok();
+}
+
+/// `template_prefix` fed into double quoted
+/// identifiers unescaped, so a prefix containing `"` could close the
+/// identifier, terminate the `CREATE DATABASE` statement, and start a new
+/// one.
+///
+/// Unlike #3 this was **real arbitrary statement execution**, not just a
+/// widened `WHERE` clause, these statements go out over simple query
+/// protocol, where a `;` really can start a new statement, whereas #3's
+/// payload was trapped inside a `DO $$ ... $$` body Postgres parses as a
+/// single unit. Confirmed by running the unescaped form against a real
+/// instance and watching it drop an unrelated database; confirmed inert
+/// against the fixed form.
+///
+/// This test drives the same payload through the ordinary public API and
+/// asserts the bystander database survives.
+#[tokio::test]
+// #[ignore]
+async fn test_malicious_template_prefix_cannot_execute_a_second_statement() {
+    let url = shared_postgres_url().await;
+    let connect_options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+
+    // A bystander database the payload tries to destroy.
+    let victim = format!("wp_victim_{}", uuid::Uuid::new_v4().simple());
+    let mut maintenance = sqlx::postgres::PgConnection::connect_with(&connect_options)
+        .await
+        .expect("failed to open maintenance connection");
+    maintenance
+        .execute(format!(r#"CREATE DATABASE "{victim}""#).as_str())
+        .await
+        .expect("test setup: failed to create the bystander database");
+
+    let malicious_prefix = format!(r#"wp_evil_"; DROP DATABASE "{victim}"; --"#);
+
+    let template = TemplatePool::builder(connect_options.clone())
+        .migrations_from("./tests/fixtures/migrations")
+        .fingerprint_salt(format!("prefix_injection_{}", uuid::Uuid::new_v4()))
+        .template_prefix(malicious_prefix)
+        .build()
+        .await
+        .expect("failed to build template pool");
+
+    // Whether this succeeds or fails is not the point, and deliberately
+    // not asserted: a prefix like this may well produce an invalid or
+    // over length database name, and erroring out is a perfectly
+    // acceptable outcome. The only thing that must hold is that it
+    // never executes the payload's second statement.
+    let _ = template.create_test_database().await;
+
+    let victim_survived: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)")
+            .bind(&victim)
+            .fetch_one(&mut maintenance)
+            .await
+            .expect("failed to check whether the bystander survived");
+
+    assert!(
+        victim_survived,
+        "a `\"` in template_prefix must never be able to terminate warmpool's \
+         own statement and run a second one, the bystander database `{victim}` \
+         was dropped, which is exactly the break-out this fix closes"
+    );
+
+    // Cleanup, best effort.
+    let _ = maintenance
+        .execute(format!(r#"DROP DATABASE IF EXISTS "{victim}""#).as_str())
+        .await;
+}
+
+/// The non-adversarial half: an ordinary custom `template_prefix` must
+/// still work exactly as documented. Without this, the test above could
+/// pass trivially if escaping had broken `template_prefix` outright.
+#[tokio::test]
+// #[ignore]
+async fn test_ordinary_custom_template_prefix_still_works() {
+    let url = shared_postgres_url().await;
+    let connect_options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+
+    let template = TemplatePool::builder(connect_options)
+        .migrations_from("./tests/fixtures/migrations")
+        .fingerprint_salt(format!("custom_prefix_{}", uuid::Uuid::new_v4()))
+        .template_prefix("my_custom_tmpl_")
+        .build()
+        .await
+        .expect("failed to build template pool");
+
+    let db = template
+        .create_test_database()
+        .await
+        .expect("a plain custom prefix must still produce a working clone");
+
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'users')",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("failed to query table existence");
+    assert!(exists, "the clone must still be fully migrated");
 
     db.drop_database().await.ok();
 }
