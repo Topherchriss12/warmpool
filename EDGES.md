@@ -24,6 +24,8 @@ Four things determine where an item sits in the sequence below, roughly in this 
 | 3 | `purge_triggers_sql` doesn't escape the schema literal | **Resolved** | 0.1.4 | Bug fix |
 | 4 | `create_test_database_sql` doesn't escape the template prefix identifier | **Reolved** | 0.1.5 | Bug fix |
 | 5 | `exclude_migration`'s actual behavior may not be the behavior it appears to be, atleast for now | Open | pending | Design decision |
+| 6 | Stale warmpool templates linger after migration churn and require manual cleanup | Open | 0.1.6 | UX |
+| 7 | Identifier truncation makes `_building` collide with the template name | Open | 0.1.7 | Bug fix |
 
 Four items **Resolved**. This table is the first thing that changes when something is.
 
@@ -157,6 +159,66 @@ decision exists. Until then, it's a design question, not a bug, and it doesn't b
 link once it exists.
 
 ---
+
+### 6. Stale warmpool templates accumulate after migration churn and create disk clutter
+
+**Status:** Open · **Target:** 0.1.6 · **Severity:** annoyance and cleanup burden, not a correctness bug.
+
+**What's broken, nothing really:** Changing migrations changes the fingerprint, which changes the template name, so the new template is built alongside the old one under a different name. Nothing blocks; nothing needs to be dropped first.
+
+The real cost is accumulation: disk usage and clutter on a long lived dev or CI instance, not breakage. A developer who touches migrations frequently can accumulate a backlog of old templates without any immediate failure. 
+
+**Why this isn't treated as a bug:** the cache is working as designed. The rough edge is that stale templates are never reclaimed automatically, so the default lifecycle does not help a developer who wants a clean instance after churn. This is a lifecycle/housekeeping issue, not a template corruption issue.
+
+**Planned fix:** add opt-in garbage collection for stale warmpool templates by enumerating databases with the template prefix and pruning those that are not the current active template for the current builder fingerprint. The default should stay off, because a destructive default is unsafe in shared environments: the prefix is not globally unique and is shared across sibling migration sets in one process, colleagues on a shared dev instance, and unrelated projects on a shared CI instance. The feature should expose a dry run listing method first, and a destructive prune method second, both as explicit user opt-ins.
+
+**Concerns**: This is a lifecycle question, not a correctness bug, and the main risk is scope. A default that silently deletes another pool's live template is a worse failure mode than a bit of stale disk clutter. The design should therefore be explicit, opt-in, and ideally dry run friendly, while preserving the existing performance win when the current template is still valid.
+
+**Tracking:** will be filed as its own issue before work begins.
+
+---
+
+
+### 7. Identifier truncation makes `_building` collide with the template name
+ 
+**Status:** Open · **Target:** 0.1.7 · **Severity:** breaks the first build outright; only reachable with a long `template_prefix` ·
+ 
+**What's broken:** Postgres truncates identifiers to 63 bytes and emits a **`NOTICE`, not an error** so this fails silently by design.
+`build_template_if_missing()` derives the in-progress name as `format!("{template_name}_building")`. When `template_name` is already at
+or near the limit, the `_building` suffix is truncated away entirely and `building_name` becomes **byte-identical to `template_name`**.
+ 
+  
+```
+-- 47-char prefix + 16-char fingerprint = 63 chars exactly
+SELECT '<prefix><fingerprint>_building'::name = '<prefix><fingerprint>'::name;
+-- t
+```
+ 
+The build sequence then does this:
+ 
+1. exists-check on `template_name` → false, so the slow path runs
+2. `sweep_and_drop_database(building_name)` → resolves to `template_name`
+3. `CREATE DATABASE building_name` → actually creates `template_name`
+4. migrations run (successfully)
+5. `ALTER DATABASE building_name RENAME TO template_name` → a **rename-to-self**, which fails: `ERROR: database "..." already exists`
+
+So the first `create_test_database()` call for that fingerprint always fails with `Error::TemplateRename`. Curiously it *self-heals*: step 3 left
+a fully-migrated database under the final name, so the next call's exists-check succeeds and returns normally. That makes this "first call always errors, subsequent calls fine" annoying and baffling but not destructive, but a hard failure either way.
+ 
+Note step 2 is harmless **only** because the exists-check above it guarantees `template_name` doesn't exist yet.Any future change that reaches the cleanup while a valid template exists would, under truncation, drop the real template.
+ 
+For you to hit this buy you need a `template_prefix` long enough to push past 63 bytes, which the default (`warmpool_tmpl_`, 14 chars + 16-char fingerprint = 30) is nowhere near. Nobody hits this by accident. But when
+hit it's a total failure with a completely misleading error, and the mechanism, silent truncation gives almost nothing to go on.
+ 
+This issues surfaced during #4's review and is a length, not escaping, problem. The fix for #4 made the reachable truncation surface slightly larger, because escaping makes names longer.
+ 
+**Possible fix** rejecting over length prefixes at `template_prefix()` with a clear error; or budgeting the suffix by
+truncating `template_prefix` ourselves so `_building` always fits; or droping the suffix scheme for a distinct generated name. 
+ 
+**Tracking:** will be filed as its own issue before work begins.
+ 
+---
+
 
 ## Resolved
  
