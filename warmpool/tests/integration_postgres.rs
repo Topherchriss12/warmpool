@@ -1263,3 +1263,238 @@ async fn test_ordinary_custom_template_prefix_still_works() {
 
     db.drop_database().await.ok();
 }
+
+/// stale templates accumulate after migration churn.
+///
+/// Changing migrations changes the fingerprint, which changes
+/// the template *name*, so the new template is built alongside the old
+/// one and nothing is blocked. The real cost is
+/// accumulation disk and clutter.
+#[tokio::test]
+// #[ignore]
+async fn test_changed_migrations_do_not_require_dropping_the_old_template() {
+    let url = shared_postgres_url().await;
+    let connect_options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+    let prefix = format!("wp_churn_{}_", uuid::Uuid::new_v4().simple());
+
+    // Two different migration sets -> two different fingerprints.
+    let pool_v1 = TemplatePool::builder(connect_options.clone())
+        .migrations_from("./tests/fixtures/migrations")
+        .template_prefix(prefix.clone())
+        .build()
+        .await
+        .expect("failed to build pool v1");
+    let db1 = pool_v1
+        .create_test_database()
+        .await
+        .expect("v1 clone failed");
+    db1.drop_database().await.ok();
+
+    // "Migrations changed": a different set, same prefix. This must
+    // succeed without anyone dropping the first template by hand.
+    let pool_v2 = TemplatePool::builder(connect_options.clone())
+        .migrations_from("./tests/fixtures/migrations_v2")
+        .template_prefix(prefix.clone())
+        .build()
+        .await
+        .expect("failed to build pool v2");
+    let db2 = pool_v2.create_test_database().await.expect(
+        "a changed migration set must build a new template alongside the old one, \
+                 not require manual cleanup first",
+    );
+
+    let has_posts: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'posts')",
+    )
+    .fetch_one(db2.pool())
+    .await
+    .unwrap();
+    assert!(has_posts, "v2's clone must reflect the new migration set");
+    db2.drop_database().await.ok();
+
+    // Both templates now exist. That accumulation is the actual problem.
+    let stale = pool_v2
+        .stale_template_names()
+        .await
+        .expect("listing stale templates should not fail");
+    assert_eq!(
+        stale.len(),
+        1,
+        "v1's template should now be visible as stale from v2's point of view: {stale:?}"
+    );
+
+    // Clean up after ourselves regardless of what the test asserted.
+    let _ = pool_v2.prune_stale_templates().await;
+}
+
+/// Pruning must drop the stale template and leave the live one alone.
+#[tokio::test]
+// #[ignore]
+async fn test_prune_stale_templates_drops_only_the_stale_ones() {
+    let url = shared_postgres_url().await;
+    let connect_options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+    let prefix = format!("wp_prune_{}_", uuid::Uuid::new_v4().simple());
+
+    let pool_v1 = TemplatePool::builder(connect_options.clone())
+        .migrations_from("./tests/fixtures/migrations")
+        .template_prefix(prefix.clone())
+        .build()
+        .await
+        .expect("failed to build pool v1");
+    pool_v1
+        .create_test_database()
+        .await
+        .expect("v1 clone failed")
+        .drop_database()
+        .await
+        .ok();
+
+    let pool_v2 = TemplatePool::builder(connect_options.clone())
+        .migrations_from("./tests/fixtures/migrations_v2")
+        .template_prefix(prefix.clone())
+        .build()
+        .await
+        .expect("failed to build pool v2");
+    pool_v2
+        .create_test_database()
+        .await
+        .expect("v2 clone failed")
+        .drop_database()
+        .await
+        .ok();
+
+    let dropped = pool_v2
+        .prune_stale_templates()
+        .await
+        .expect("prune should succeed");
+    assert_eq!(
+        dropped.len(),
+        1,
+        "exactly v1's template should be dropped: {dropped:?}"
+    );
+
+    // v2's own template must still be usable afterward -- pruning must
+    // never take out the template the pool is actively using.
+    let db = pool_v2
+        .create_test_database()
+        .await
+        .expect("the live template must survive pruning");
+    db.drop_database().await.ok();
+
+    let still_stale = pool_v2.stale_template_names().await.unwrap();
+    assert!(
+        still_stale.is_empty(),
+        "nothing should remain stale: {still_stale:?}"
+    );
+}
+
+/// Pruning is scoped by prefix, and that scoping must be exact. A naive
+/// `datname LIKE 'warmpool_tmpl_%'` is flawed here, because `_` is a
+/// single character wildcard in `LIKE` and the default prefix is full of
+/// them. When the default prefix is used, a `LIKE`-based prune could easily have
+/// matched an unrelated `warmpoolXtmplXdddd` database that a destructive
+/// prune would then have dropped. This test pins the behavior,
+/// a database that merely *resembles* the prefix is never touched.
+#[tokio::test]
+// #[ignore]
+async fn test_prune_does_not_touch_databases_that_only_resemble_the_prefix() {
+    let url = shared_postgres_url().await;
+    let connect_options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    let prefix = format!("wp_like_{unique}_");
+    // Same length and shape, but with the underscores replaced -- only a
+    // LIKE-wildcard match would catch this one.
+    let lookalike = format!("wpXlike{unique}X0000");
+
+    let mut maintenance = sqlx::postgres::PgConnection::connect_with(&connect_options)
+        .await
+        .expect("failed to open maintenance connection");
+    maintenance
+        .execute(format!(r#"CREATE DATABASE "{lookalike}""#).as_str())
+        .await
+        .expect("test setup: failed to create the lookalike database");
+
+    let pool = TemplatePool::builder(connect_options.clone())
+        .migrations_from("./tests/fixtures/migrations")
+        .template_prefix(prefix)
+        .build()
+        .await
+        .expect("failed to build pool");
+    pool.create_test_database()
+        .await
+        .expect("clone failed")
+        .drop_database()
+        .await
+        .ok();
+
+    let _ = pool
+        .prune_stale_templates()
+        .await
+        .expect("prune should succeed");
+
+    let lookalike_survived: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)")
+            .bind(&lookalike)
+            .fetch_one(&mut maintenance)
+            .await
+            .unwrap();
+    assert!(
+        lookalike_survived,
+        "`{lookalike}` does not share the prefix and must never be pruned"
+    );
+
+    let _ = maintenance
+        .execute(format!(r#"DROP DATABASE IF EXISTS "{lookalike}""#).as_str())
+        .await;
+}
+
+/// Pruning is off unless asked for. A pool built without
+/// `prune_stale_templates_on_build(true)` must leave other templates
+/// alone, because prefix scoping is shared with sibling migration sets
+/// and unrelated projects.
+#[tokio::test]
+// #[ignore]
+async fn test_pruning_does_not_happen_unless_explicitly_enabled() {
+    let url = shared_postgres_url().await;
+    let connect_options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+    let prefix = format!("wp_optin_{}_", uuid::Uuid::new_v4().simple());
+
+    let pool_v1 = TemplatePool::builder(connect_options.clone())
+        .migrations_from("./tests/fixtures/migrations")
+        .template_prefix(prefix.clone())
+        .build()
+        .await
+        .expect("failed to build pool v1");
+    pool_v1
+        .create_test_database()
+        .await
+        .expect("v1 clone failed")
+        .drop_database()
+        .await
+        .ok();
+
+    // Default builder: no pruning requested.
+    let pool_v2 = TemplatePool::builder(connect_options.clone())
+        .migrations_from("./tests/fixtures/migrations_v2")
+        .template_prefix(prefix.clone())
+        .build()
+        .await
+        .expect("failed to build pool v2");
+    pool_v2
+        .create_test_database()
+        .await
+        .expect("v2 clone failed")
+        .drop_database()
+        .await
+        .ok();
+
+    let stale = pool_v2.stale_template_names().await.unwrap();
+    assert_eq!(
+        stale.len(),
+        1,
+        "v1's template must still be present -- pruning must not happen by default: {stale:?}"
+    );
+
+    let _ = pool_v2.prune_stale_templates().await;
+}

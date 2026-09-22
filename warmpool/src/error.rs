@@ -142,6 +142,27 @@ pub enum Error {
         source: sqlx::Error,
     },
 
+    /// Fired while listing or dropping stale templates, either from
+    /// [`TemplatePool::stale_template_names`] /
+    /// [`TemplatePool::prune_stale_templates`] called directly, or from
+    /// the optional post build hook enabled by
+    /// `TemplatePoolBuilder::prune_stale_templates_on_build`.
+    ///
+    /// Pruning is deliberately **opt-in and never automatic by default**.
+    /// Templates are scoped only by their name prefix, and the default
+    /// prefix is shared by every warmpool user on a given Postgres
+    /// instance including sibling migration sets in the *same* process
+    /// (which `TemplatePoolBuilder` explicitly supports) and unrelated
+    /// projects on a shared CI instance. A template that is "stale" from
+    /// one pool's point of view may be the live, in-use template of
+    /// another.
+    #[error("failed to prune stale templates with prefix `{prefix}`")]
+    PruneStaleTemplates {
+        prefix: String,
+        #[source]
+        source: sqlx::Error,
+    },
+
     /// Fired from `build_or_reuse_template()`, on the same
     /// maintenance connection already opened to check for / build the
     /// template, before the advisory lock is taken. Cached for the

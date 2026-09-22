@@ -32,6 +32,7 @@ pub struct TemplatePoolBuilder {
     template_prefix: String,
     fingerprint_salt: Option<String>,
     clone_strategy: CloneStrategy,
+    prune_stale_on_build: bool,
 }
 
 impl TemplatePoolBuilder {
@@ -44,6 +45,7 @@ impl TemplatePoolBuilder {
             template_prefix: "warmpool_tmpl_".to_string(),
             fingerprint_salt: None,
             clone_strategy: CloneStrategy::default(),
+            prune_stale_on_build: false,
         }
     }
 
@@ -105,6 +107,40 @@ impl TemplatePoolBuilder {
         self
     }
 
+    /// After this pool builds or reuses its template, drop every *other*
+    /// database sharing this pool's template prefix. Defaults to
+    /// `false`, and that default is deliberate.
+    ///
+    /// When your migrations change, the fingerprint changes, so the new
+    /// template gets a new *name* and is built alongside the old one --
+    /// nothing is blocked, nothing has to be dropped first. The old
+    /// template simply sits there unused. So this option is about
+    /// reclaiming space and reducing clutter, not about unblocking a
+    /// build.
+    ///
+    /// Why it isn't the default: "every other database with this prefix"
+    /// is the only scoping available, and the default prefix
+    /// (`warmpool_tmpl_`) is shared by everything using warmpool against
+    /// a given Postgres instance. That includes sibling migration sets in
+    /// the same process (see this type's own docs -- multiple migration
+    /// sets in one process is a supported use), colleagues sharing a dev
+    /// instance, and unrelated projects sharing a CI instance. A template
+    /// that looks stale to this pool may be another pool's live one.
+    ///
+    /// Enable it only when this pool owns its prefix. If you have more
+    /// than one migration set, give each its own
+    /// [`TemplatePoolBuilder::template_prefix`] first. To see what would
+    /// be dropped without dropping anything, call
+    /// [`TemplatePool::stale_template_names`].
+    ///
+    /// Databases whose names end in `_building` are never pruned: those
+    /// belong to the crash-atomic build path and may be a build in
+    /// progress for a different fingerprint right now.
+    pub fn prune_stale_templates_on_build(mut self, prune: bool) -> Self {
+        self.prune_stale_on_build = prune;
+        self
+    }
+
     /// Controls the `CREATE DATABASE ... STRATEGY` used when cloning the
     /// template for each test database. Defaults to
     /// [`CloneStrategy::WalLog`] as of 0.1.1. see the README's "Clone
@@ -144,6 +180,7 @@ impl TemplatePoolBuilder {
             template_prefix: self.template_prefix,
             fingerprint_salt: self.fingerprint_salt,
             clone_strategy: self.clone_strategy,
+            prune_stale_on_build: self.prune_stale_on_build,
             template_info: Arc::new(OnceCell::new()),
         })
     }
@@ -162,6 +199,7 @@ pub struct TemplatePool {
     template_prefix: String,
     fingerprint_salt: Option<String>,
     clone_strategy: CloneStrategy,
+    prune_stale_on_build: bool,
     template_info: Arc<OnceCell<TemplateInfo>>,
 }
 
@@ -253,13 +291,79 @@ impl TemplatePool {
         let prefix = self.template_prefix.clone();
         let salt = self.fingerprint_salt.clone();
 
+        let prune = self.prune_stale_on_build;
+
         self.template_info
             .get_or_try_init(|| async move {
-                build_or_reuse_template(&connect_options, &migrations, &prefix, salt.as_deref())
-                    .await
+                let info = build_or_reuse_template(
+                    &connect_options,
+                    &migrations,
+                    &prefix,
+                    salt.as_deref(),
+                )
+                .await?;
+
+                // Runs inside the OnceCell initializer so it happens once
+                // per TemplatePool, not once per clone.
+                if prune {
+                    let mut conn = PgConnection::connect_with(&connect_options)
+                        .await
+                        .map_err(Error::MaintenanceConnect)?;
+                    prune_stale_templates_with(&mut conn, &prefix, &info.name)
+                        .await
+                        .map_err(|source| Error::PruneStaleTemplates {
+                            prefix: prefix.clone(),
+                            source,
+                        })?;
+                }
+
+                Ok(info)
             })
             .await
             .cloned()
+    }
+
+    /// List the databases [`TemplatePool::prune_stale_templates`] would
+    /// drop, without dropping anything. Use this before enabling
+    /// pruning, especially on a Postgres instance shared with other
+    /// projects or other migration sets.
+    /// [`TemplatePoolBuilder::prune_stale_templates_on_build`] documents why
+    /// prefix scoping is weaker than it looks.
+    pub async fn stale_template_names(&self) -> Result<Vec<String>> {
+        let info = self.ensure_template().await?;
+        let mut conn = PgConnection::connect_with(&self.connect_options)
+            .await
+            .map_err(Error::MaintenanceConnect)?;
+
+        find_stale_templates(&mut conn, &self.template_prefix, &info.name)
+            .await
+            .map_err(|source| Error::PruneStaleTemplates {
+                prefix: self.template_prefix.clone(),
+                source,
+            })
+    }
+
+    /// Drop every database sharing this pool's template prefix except the
+    /// one this pool is currently using, and except any `_building`
+    /// database (which may be an in-progress build for a different
+    /// fingerprint). Returns the names actually dropped.
+    ///
+    /// This is destructive and scoped only by prefix. Read
+    /// [`TemplatePoolBuilder::prune_stale_templates_on_build`] before
+    /// calling it, and consider
+    /// [`TemplatePool::stale_template_names`] first.
+    pub async fn prune_stale_templates(&self) -> Result<Vec<String>> {
+        let info = self.ensure_template().await?;
+        let mut conn = PgConnection::connect_with(&self.connect_options)
+            .await
+            .map_err(Error::MaintenanceConnect)?;
+
+        prune_stale_templates_with(&mut conn, &self.template_prefix, &info.name)
+            .await
+            .map_err(|source| Error::PruneStaleTemplates {
+                prefix: self.template_prefix.clone(),
+                source,
+            })
     }
 }
 
@@ -510,6 +614,59 @@ async fn purge_triggers(conn: &mut PgConnection, schema: &str) -> Result<()> {
     Ok(())
 }
 
+/// Find databases sharing `prefix` that aren't `current_template`.
+///
+/// Matching uses `left(datname, length($1)) = $1` not
+/// `datname LIKE $1 || '%'` on purpose: `_` is a single character
+/// wildcard in `LIKE`, and the default prefix `warmpool_tmpl_` is full of
+/// them, so a `LIKE` form would also match names like `warmpool-tmplX...`
+/// that merely resemble the prefix.
+/// That difference matters for this is a *destructive* operation,
+/// so we uses plain prefix equality.
+///
+/// `_building` databases are skipped: they belong to the crash atomic
+/// build path and may be an in-progress build for another fingerprint.
+/// Postgres managed template databases (`datistemplate`) are skipped too,
+/// so a prefix that somehow matched `template0`/`template1` could never
+/// take them out.
+async fn find_stale_templates(
+    conn: &mut PgConnection,
+    prefix: &str,
+    current_template: &str,
+) -> std::result::Result<Vec<String>, sqlx::Error> {
+    let names: Vec<String> = sqlx::query_scalar(
+        "SELECT datname \
+         FROM pg_database \
+         WHERE left(datname, length($1)) = $1 \
+           AND datname <> $2 \
+           AND right(datname, 9) <> '_building' \
+           AND NOT datistemplate \
+         ORDER BY datname",
+    )
+    .bind(prefix)
+    .bind(current_template)
+    .fetch_all(conn)
+    .await?;
+
+    Ok(names)
+}
+
+async fn prune_stale_templates_with(
+    conn: &mut PgConnection,
+    prefix: &str,
+    current_template: &str,
+) -> std::result::Result<Vec<String>, sqlx::Error> {
+    let stale = find_stale_templates(conn, prefix, current_template).await?;
+
+    let mut dropped = Vec::with_capacity(stale.len());
+    for name in stale {
+        sweep_and_drop_database(conn, &name).await?;
+        dropped.push(name);
+    }
+
+    Ok(dropped)
+}
+
 // SQL / connection management helpers
 //
 // The three `*_sql` functions are extracted so the exact statement text is
@@ -531,8 +688,7 @@ async fn purge_triggers(conn: &mut PgConnection, schema: &str) -> Result<()> {
 /// doubling it, and backslash has no special meaning at all, so there is
 /// no `E'...'`-style escape mode question to worry about here.
 ///
-/// This matters more than the string literal gap did. `purge_triggers_sql`'s
-/// output goes into a `DO $$ ... $$` body, which Postgres parses as a
+/// `purge_triggers_sql`'s output goes into a `DO $$ ... $$` body, which Postgres parses as a
 /// single unit, so a break out there could only widen a `WHERE` clause.
 /// These identifiers go into statements sent via simple query protocol,
 /// where a break out *can* terminate the statement and start a new one,
@@ -597,9 +753,8 @@ fn drop_database_if_exists_sql(name: &str) -> String {
 /// before interpolation, so a schema name containing a `'` or `\` can no
 /// longer break out of the literal. In practice `schema` is a
 /// compile-time-ish config value from [`TemplatePoolBuilder::purge_triggers_in`],
-/// not end-user input, which is the only reason this we consider thid low practical risk gap
-/// not an exploitable one. See `purge_triggers_sql_neutralizes_a_quote_and_semicolon_injection_attempt`
-/// test for what it looks like closed.
+/// not end-user input. See `purge_triggers_sql_neutralizes_a_quote_and_semicolon_injection_attempt`
+/// test.
 fn purge_triggers_sql(schema: &str) -> String {
     let schema_literal = escape_sql_literal(schema);
     format!(
@@ -729,6 +884,7 @@ mod tests {
         assert!(builder.purge_schemas.is_empty());
         assert!(builder.fingerprint_salt.is_none());
         assert_eq!(builder.clone_strategy, CloneStrategy::WalLog);
+        assert!(!builder.prune_stale_on_build);
     }
 
     // TemplatePoolBuilder: each setter sets its field
@@ -768,6 +924,13 @@ mod tests {
         let builder = TemplatePoolBuilder::new(dummy_connect_options())
             .clone_strategy(CloneStrategy::FileCopy);
         assert_eq!(builder.clone_strategy, CloneStrategy::FileCopy);
+    }
+
+    #[test]
+    fn builder_prune_stale_templates_on_build_sets_flag() {
+        let builder =
+            TemplatePoolBuilder::new(dummy_connect_options()).prune_stale_templates_on_build(true);
+        assert!(builder.prune_stale_on_build);
     }
 
     #[test]
@@ -974,9 +1137,9 @@ mod tests {
         let escaped = escape_sql_literal(r"public\");
         assert_eq!(
             escaped, r"E'public\\'",
-            "the trailing backslash must be doubled, if it weren't, \\' \
+            "the trailing backslash must be doubled -- if it weren't, \\' \
              at the end would be read as an escaped quote (string still \
-             open) instead of a backslash followed by the closing quote"
+             open) rather than a backslash followed by the closing quote"
         );
     }
 
@@ -984,8 +1147,7 @@ mod tests {
     fn purge_triggers_sql_neutralizes_a_boolean_where_clause_injection() {
         // The *exploitable* payload shape here.
         //
-        // Worth being precise about the mechanism, because the obvious
-        // guess and assumption is wrong: a `'; DROP TABLE x; --` style payload does NOT
+        // A `'; DROP TABLE x; --` style payload does NOT
         // work against this function. The interpolation point sits inside
         // a dollar quoted `DO $$ ... $$` body, which Postgres parses as a
         // single unit, so a stray `;` can't start a new top-level
