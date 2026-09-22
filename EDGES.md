@@ -22,123 +22,16 @@ Four things determine where an item sits in the sequence below, roughly in this 
 | 1 | No stale connection sweep on the template before cloning | **Resolved** | 0.1.2 | Bug fix |
 | 2 | Template construction isn't crash atomic | **Resolved** | 0.1.3 | Bug fix |
 | 3 | `purge_triggers_sql` doesn't escape the schema literal | **Resolved** | 0.1.4 | Bug fix |
-| 4 | `create_test_database_sql` doesn't escape the template prefix identifier | **Reolved** | 0.1.5 | Bug fix |
+| 4 | `create_test_database_sql` doesn't escape the template prefix identifier | **Resolved** | 0.1.5 | Bug fix |
 | 5 | `exclude_migration`'s actual behavior may not be the behavior it appears to be, atleast for now | Open | pending | Design decision |
-| 6 | Stale warmpool templates linger after migration churn and require manual cleanup | Open | 0.1.6 | UX |
+| 6 | Stale warmpool templates linger after migration churn and require manual cleanup | **Resolved** | 0.1.6 | UX |
 | 7 | Identifier truncation makes `_building` collide with the template name | Open | 0.1.7 | Bug fix |
 
-Four items **Resolved**. This table is the first thing that changes when something is.
+Five items **Resolved**. This table is the first thing that changes when something is.
 
 ---
 
 ## Open
-
-### 1. No stale connection sweep on the template before cloning
-
-**Status:** Resolved · **Target:** 0.1.2 · Failed loudly.
-
-**What's broken:** `create_test_database()` issues `CREATE DATABASE ... TEMPLATE <name> ...` with no guard against other connections to the template. Postgres refuses that statement outright if *anyone* is
-connected to the source database not just warmpool's own connections.
-
-Confirmed directly:
-
-```
-$ psql -d warmpool_tmpl_xxxx -c 'SELECT pg_sleep(30)'   # held open
-$ psql -c 'CREATE DATABASE t TEMPLATE warmpool_tmpl_xxxx STRATEGY = WAL_LOG'
-ERROR:  source database "warmpool_tmpl_xxxx" is being accessed by other users
-DETAIL:  There is 1 other session using the database.
-```
-
-A crashed test process that didn't unwind cleanly, a developer's `psql` session left open while poking at the template to debug something, a monitoring query, a connection pooler's health check. Any of these
-blocks *every* subsequent clone until the stray connection closes on its own. 
-
-`TestDatabase::drop_database()` already guards against exactly this class of problem for the database it owns:
-
-```rust
-sqlx::query(
-    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-     WHERE datname = $1 AND pid <> pg_backend_pid()"
-)
-```
-
-`create_test_database()` has no equivalent sweep for the template it clones *from*. A project can most likely hit this, as it depends on developer discipline and CI env, but when it does, it fails loudly and completely. Which is why we prioritize it.
-
-**Planned fix:** a `pg_terminate_backend` sweep against the template's `datname`, mirroring `drop_database()`'s existing pattern, run immediately before the `CREATE DATABASE ... TEMPLATE` statement in `create_test_database()`.
-
-**Concerns** Does sweeping the template introduces any new race against a *concurrent template build* the advisory lock already serializes builds against each other, but this sweep runs outside that lock, on the clone path, and needs to be checked against the build path's own connection lifecycle so it can't
-accidentally terminate a build that's legitimately in progress. Test coverage should include a test that opens a connection to the template and verifies that `create_test_database()` terminates it and proceeds, and a test that opens a connection to the template while a build is in progress and verifies that the build completes successfully and the clone fails with the expected "template is being accessed by other users" error.
-
-**Tracking:** was filed as its own issue before work began.
-
----
-
-### 2. Template construction isn't crash-atomic
-
-**Status:** Resolved · **Target:** 0.1.3 · Failed silently, but was worse than it sounds.
-
-**What's broken:** `build_template_if_missing()` creates the template database under its final, fingerprinted name and runs migrations against it in place. If the process building it dies mid-migration like a killed CI
-job, an OOM, a migration that panics the process instead of returning an `Err`, the template exists under its expected name with only some migrations applied. The next process to call `ensure_template()` runs its existence check (`SELECT EXISTS (... FROM pg_database WHERE datname =$1)`), finds the row, and treats the template as ready. Every clone from that point on is missing whatever didn't finish applying.
-
-This is worse than it sounds because of *how* it fails downstream: tests don't get an infrastructure error, they get `relation "..." does not exist` from what looks like a real schema bug, on some but not all
-tables, and every clone shares the same broken template until someone notices and manually drops it. The existence check has no way to distinguish "fully built" from "build started and never finished" the way it does for "never built" vs. "fully built." The only way to recover is to drop the template and rebuild it, which is a manual operation that requires someone to notice the problem and know how to fix it.
-
-**Why it's ranked second, not first:** the trigger (a crash landing specifically mid-migration) is much rarer than "someone left a psql session open." But a silent, confusing failure mode that poisons a shared
-template for an entire team outranks a loud one at lower frequency, this is the more dangerous failure to leave open, just a less likely one.
-
-**Planned fix:** build the template under a `<name>_building` suffix, run every migration against that, and only `ALTER DATABASE <name>_building RENAME TO <name>` after every migration succeeds. The rename is atomic
-from Postgres's catalog perspective there is no window where a half migrated database exists under the final name.
-
-**Concerns**. This touches the same advisory lock guarded section that item #1's fix and 0.1.1's
-`server_version_num` caching both already touch. Sequencing this after #1 means it reviews against a stable version of that section and not a moving one.
-Also, what happens to an orphaned `<name>_building` database left behind by a crash under the *new* code ?
-Does a later build attempt clean it up, or does it need its own explicit handling to avoid accumulating half built templates under `_building` names the same way stale full templates already can.
-
-**Tracking:** was filed as its own issue before work began.
-
----
-
-### 3. `purge_triggers_sql` doesn't escape the schema literal
-
-**Status:** Resolved · **Target:** 0.1.4 · Practical risk is low, but it's a real defect.
-
-**What's broken:** `TemplatePoolBuilder::purge_triggers_in(schema)` interpolates `schema` directly into a single quoted SQL string literal inside a `DO $$ ... $$` block:
-
-```rust
-format!("... WHERE nspname = '{schema}' AND NOT tgisinternal ...")
-```
-
-A schema name containing a `'` breaks out of the literal. In practice `schema` is a small, fixed, developer supplied configuration value passed once at builder construction time, not end-user or runtime input, which
-is the only reason this hasn't been a real-world problem. It's still unescaped, and pool.rs's test suite documents the gap explicitly see`purge_triggers_sql_does_not_escape_embedded_quotes`.
-
-**Why this is its own patch, not bundled with #4:** these are two different code paths a string literal context here, a quoted identifier context in #4 with different escaping rules (doubling `'` vs. doubling
-`"`) and different test surfaces. Fixing them together would make either fix harder to review in isolation, and a mistake in one wouldn't be caught by the other's review.
-
-**Planned fix:** escape `schema` before interpolation (double any embedded `'`), or switch to Postgres's `quote_literal()` inside the generated SQL rather than doing string escaping in Rust. Replace the
-test that currently documents the gap with one asserting the previously vulnerable input is now handled safely.
-
-**Tracking:** was filed as its own issue before work began.
-
----
-
-### 4. `create_test_database_sql` doesn't escape the template prefix identifier
-
-**Status:** Open · **Target:** 0.1.5 · Low practical risk, but it's a real defect.
-
-**What's broken:** `TemplatePoolBuilder::template_prefix(prefix)` feeds into a double quoted identifier in the generated `CREATE DATABASE` statement:
-
-```rust
-format!(r#"CREATE DATABASE "{db_name}" WITH TEMPLATE "{template_name}"{strategy_clause};"#)
-```
-
-`db_name` (a UUID) and the fingerprint half of `template_name` are always safe by construction they're generated by warmpool itself, not supplied by a caller. `template_prefix` is caller supplied, and a prefix
-containing a `"` breaks out of the quoted identifier. Same practical risk profile as #3 (a config value, not runtime input), same treatment in the test suite, see `create_test_database_sql_does_not_escape_embedded_quotes_in_names_either`.
-
-**Planned fix:** escape `template_prefix` at the point `TemplatePoolBuilder::template_prefix()` is called, or apply Postgres identifier quoting rules (double any embedded `"`) when constructing the SQL. 
-Replace the documenting test with one asserting safe handling.
-
-**Tracking:** was filed as its own issue after #3 to keep the two escaping fixes reviewable independently not as a pair.
-
----
 
 ### 5. `exclude_migration`'s actual behavior may not be the behavior you might mistake it for.
 
@@ -159,25 +52,6 @@ decision exists. Until then, it's a design question, not a bug, and it doesn't b
 link once it exists.
 
 ---
-
-### 6. Stale warmpool templates accumulate after migration churn and create disk clutter
-
-**Status:** Open · **Target:** 0.1.6 · **Severity:** annoyance and cleanup burden, not a correctness bug.
-
-**What's broken, nothing really:** Changing migrations changes the fingerprint, which changes the template name, so the new template is built alongside the old one under a different name. Nothing blocks; nothing needs to be dropped first.
-
-The real cost is accumulation: disk usage and clutter on a long lived dev or CI instance, not breakage. A developer who touches migrations frequently can accumulate a backlog of old templates without any immediate failure. 
-
-**Why this isn't treated as a bug:** the cache is working as designed. The rough edge is that stale templates are never reclaimed automatically, so the default lifecycle does not help a developer who wants a clean instance after churn. This is a lifecycle/housekeeping issue, not a template corruption issue.
-
-**Planned fix:** add opt-in garbage collection for stale warmpool templates by enumerating databases with the template prefix and pruning those that are not the current active template for the current builder fingerprint. The default should stay off, because a destructive default is unsafe in shared environments: the prefix is not globally unique and is shared across sibling migration sets in one process, colleagues on a shared dev instance, and unrelated projects on a shared CI instance. The feature should expose a dry run listing method first, and a destructive prune method second, both as explicit user opt-ins.
-
-**Concerns**: This is a lifecycle question, not a correctness bug, and the main risk is scope. A default that silently deletes another pool's live template is a worse failure mode than a bit of stale disk clutter. The design should therefore be explicit, opt-in, and ideally dry run friendly, while preserving the existing performance win when the current template is still valid.
-
-**Tracking:** will be filed as its own issue before work begins.
-
----
-
 
 ### 7. Identifier truncation makes `_building` collide with the template name
  
@@ -219,9 +93,25 @@ truncating `template_prefix` ourselves so `_building` always fits; or droping th
  
 ---
 
-
 ## Resolved
  
+### 6. Stale warmpool templates linger after migration churn
+ 
+**Resolved in:** 0.1.6
+
+Changing migrations changes the template fingerprint, which changes the template name. The new template is built alongside the old one under a different name, so there is no "drop before create" step to reclaim space. The real cost is accumulation: stale templates pile up on long-lived dev or CI instances, wasting disk space and cluttering the namespace.
+
+**The fix:** added cleanup helpers and a builder option to make the operation intentional. `TemplatePool::stale_template_names()` lists what pruning would remove without deleting anything; `TemplatePool::prune_stale_templates()` deletes the stale templates and returns the names it dropped; and `TemplatePoolBuilder::prune_stale_templates_on_build(bool)` runs the prune once per pool while the template is being built or reused, but defaults to `false`.
+
+This is a lifecycle/housekeeping problem, not a correctness bug, so the default remains off. The name prefix is shared by sibling migration sets in the same process and by unrelated projects on a shared Postgres instance, and a destructive default would silently delete another pool's live template on every build. The implementation uses plain byte-prefix equality rather than `LIKE`, skips names ending in `_building`, and excludes template databases so the prune stays scoped to stale warmpool templates instead of other databases that merely resemble the prefix.
+
+The option is fully opt-in, dry run friendly, and does not change the normal fast path for users who do not want automatic cleanup. It solves the stale template accumulation problem without forcing a destructive default onto shared environments.
+
+**[ISSUE#6](https://github.com/Topherchriss12/warmpool/issues/5#issue-5522247570)**
+
+---
+
+
 ### 4. Identifier interpolation is unescaped across all name-building helpers
  
 **Resolved in:** 0.1.5
@@ -240,6 +130,8 @@ truncating `template_prefix` ourselves so `_building` always fits; or droping th
 `template database "evil"; DROP DATABASE wp_victim; --" does not exist`.
 
 **[ISSUE#4](https://github.com/Topherchriss12/warmpool/issues/4#issue-5494615289)**
+
+---
 
 
 ### 3. `purge_triggers_sql` doesn't escape the schema literal
@@ -288,6 +180,9 @@ The script creates an orphaned `_building` database with a partially applied sch
 ***Do not point PGURL at a database containing data you need to preserve and obviously not to a production database***.
 
 **[ISSUE#2](https://github.com/Topherchriss12/warmpool/issues/2#issue-5408173016)**
+
+---
+
 
 ### 1. No stale-connection sweep on the template before cloning
 

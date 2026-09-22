@@ -175,3 +175,43 @@ Inside a double quoted identifier, `"` is escaped by doubling it, and **backslas
 No breaking changes.
 
 No new dependencies. This release fixes a bug.
+
+## 0.1.6
+
+### Template accumulation after migration churn.
+
+Changing migrations changes the fingerprint, which changes the template **name**, so the new template is built alongside the old one under a different name. Nothing blocks. Nothing has to be dropped first. 
+
+The real cost is **accumulation** disk and clutter on a long lived dev or CI instance and not breakage.
+
+Reclaiming space means *enumerating* databases by prefix and dropping the ones that aren't yours, a garbage collection kinda operation, not a drop before create because there is nothing to drop really. The new `TemplatePool::stale_template_names()` returns what would be dropped, and `TemplatePool::prune_stale_templates()` drops them. `TemplatePoolBuilder::prune_stale_templates_on_build(bool)` controls whether pruning runs automatically on every build, **defaulting to `false`**.
+
+### Defaulting to `true` is a bad idea.
+
+The only scoping available is the name prefix, and the default prefix `warmpool_tmpl_` is shared by:
+
+- **sibling migration sets in the same process**; `TemplatePoolBuilder`'s supports multiple migration sets in one process. Two pools with different migration directories and the default prefix produce different fingerprints, so each looks stale to the other. A destructive default would have them delete each other's templates on every build, dooming the other migration set to rebuild from scratch every time.
+
+- **others on a shared dev instance**, and **unrelated projects on a shared CI instance**, the advisory-lock design anticipates that two unrelated projects that both depend on warmpool and happen to point at the same Postgres instance.
+
+A default that silently destroys another pool's live template on every build is a worse failure than the clutter it cleans up. So pruning ships **opt-in, default off**, with a dry run listing method. Flipping the default is a one line change if you disagree but it should be a decision, not an accident.
+
+### Added
+
+- `TemplatePool::stale_template_names()`; returns what pruning *would* drop, dropping nothing. Intended to be run before enabling pruning on any shared instance, just to see what would be dropped. The names returned are the same ones that `prune_stale_templates()` drops.
+- `TemplatePool::prune_stale_templates()`; drops them, returns the names dropped.
+- `TemplatePoolBuilder::prune_stale_templates_on_build(bool)`; **defaults to `false`**. When enabled, pruning runs once per `TemplatePool`, inside the same `OnceCell` initializer that builds the template, not once per clone.
+- `Error::PruneStaleTemplates`.
+- Integration tests, including one pinning the behavior described above
+(`test_changed_migrations_do_not_require_dropping_the_old_template`) and one for the matching hazard below.
+
+
+The query `datname LIKE 'warmpool_tmpl_%'` is **wrong for a destructive operation**, because `_` is a single character wildcard in `LIKE` and the default prefix is full of them.
+
+The implementation uses `left(datname, length($1)) = $1` instead, plain byte-prefix equality, no wildcard semantics. `test_prune_does_not_touch_databases_that_only_resemble_the_prefix` pins this.
+
+Names ending in `_building` are never pruned they may be an in-progress build for another fingerprint, and `datistemplate` databases are excluded so a pathological prefix could never reach `template0`/`template1`.
+
+### Compatibility
+
+No breaking changes. This release adds a new builder option that does not exist on the macro. `warm_test` builds a fresh `TemplatePool` per test function; a per test prune would mean every test in a suite racing to delete templates that the *other tests in the same run* may be mid-clone from. The macro is not a good fit for this option, and the builder is the only place it exists. The macro continues to be a convenience wrapper around the builder, but it will not expose every option the builder supports.
