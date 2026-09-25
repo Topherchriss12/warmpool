@@ -142,6 +142,32 @@ pub enum Error {
         source: sqlx::Error,
     },
 
+    /// Fired from `TemplatePoolBuilder::build()` when the template name
+    /// this configuration would produce is too long for Postgres.
+    ///
+    /// Postgres truncates identifiers to 63 bytes and only emits a
+    /// `NOTICE`, never an error, so without this check the failure is
+    /// silent and deeply confusing. The name that actually has to fit is
+    /// not the template name itself but the `_building` name derived from
+    /// it by the crash-atomic build path.
+    /// If `<template>_building` truncates back down to `<template>`, the two
+    /// become byte identical and the build's final rename turns into a
+    /// rename to self that fails with `database "..." already exists`.
+    ///
+    /// `limit` is the budget for `prefix` specifically: the 63-byte
+    /// identifier limit minus the fingerprint length and the `_building`
+    /// suffix.
+    #[error(
+        "template prefix `{prefix}` is {actual} bytes, which leaves no room for the \
+         fingerprint and the `_building` suffix within Postgres's 63-byte identifier \
+         limit (maximum usable prefix here: {limit} bytes)"
+    )]
+    TemplatePrefixTooLong {
+        prefix: String,
+        actual: usize,
+        limit: usize,
+    },
+
     /// Fired while listing or dropping stale templates, either from
     /// [`TemplatePool::stale_template_names`] /
     /// [`TemplatePool::prune_stale_templates`] called directly, or from

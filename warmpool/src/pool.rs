@@ -11,6 +11,35 @@ use uuid::Uuid;
 
 type ExcludeFn = Arc<dyn Fn(&Migration) -> bool + Send + Sync>;
 
+/// Postgres's identifier limit. Names longer than this are silently
+/// truncated (a `NOTICE`, not an error), which is what makes an
+/// over-long template prefix fail so confusingly -- see
+/// [`Error::TemplatePrefixTooLong`] and SHARP_EDGES.md #7.
+///
+/// This is `NAMEDATALEN - 1` and is a compile-time constant in the
+/// server, not a runtime setting, so it's safe to hard-code. A server
+/// built with a non-default `NAMEDATALEN` would have a *larger* limit,
+/// making this check conservative rather than wrong.
+const PG_MAX_IDENTIFIER_BYTES: usize = 63;
+
+/// The suffix `build_template_if_missing()` appends while building.
+/// The `_building` name is the longest identifier warmpool constructs,
+/// so it -- not the template name itself -- is what has to fit.
+const BUILDING_SUFFIX: &str = "_building";
+
+/// Longest prefix that still leaves room for the fingerprint and the
+/// `_building` suffix.
+///
+/// Measured in bytes, not chars: Postgres truncates by byte, so a prefix
+/// of multi-byte characters uses up the budget faster than its `char`
+/// count suggests. (Truncation is also not encoding-aware, so a
+/// byte-truncated name can even end mid-character.)
+fn max_template_prefix_bytes(fingerprint_len: usize) -> usize {
+    PG_MAX_IDENTIFIER_BYTES
+        .saturating_sub(fingerprint_len)
+        .saturating_sub(BUILDING_SUFFIX.len())
+}
+
 /// The template's name plus the server's numeric version, cached together
 /// so [`CloneStrategy::sql_clause`] doesn't need a second round trip on
 /// every [`TemplatePool::create_test_database`] call.
@@ -172,6 +201,24 @@ impl TemplatePoolBuilder {
             })
             .cloned()
             .collect();
+
+        // Validate the prefix here rather than in template_prefix():
+        // the budget depends on the fingerprint length, which isn't
+        // known until the migration set has been loaded. Failing at
+        // build() still means the caller finds out before any database
+        // work happens, and gets a typed error instead of a silent
+        // truncation they'd have to reverse-engineer from a
+        // rename-to-self failure much later. See SHARP_EDGES.md #7.
+        let fingerprint_len = fingerprint(&migrations, self.fingerprint_salt.as_deref()).len();
+        let limit = max_template_prefix_bytes(fingerprint_len);
+        let actual = self.template_prefix.len();
+        if actual > limit {
+            return Err(Error::TemplatePrefixTooLong {
+                prefix: self.template_prefix.clone(),
+                actual,
+                limit,
+            });
+        }
 
         Ok(TemplatePool {
             connect_options: self.connect_options,
@@ -1192,6 +1239,112 @@ mod tests {
         assert!(
             sql.contains(&format!("nspname = E'{expected_literal_body}'")),
             "payload must be fully contained in one escaped literal: got {sql}"
+        );
+    }
+
+    #[test]
+    fn max_template_prefix_bytes_reserves_room_for_fingerprint_and_suffix() {
+        // 63 - 16 (fingerprint) - 9 ("_building") = 38
+        assert_eq!(max_template_prefix_bytes(16), 38);
+    }
+
+    #[test]
+    fn max_template_prefix_bytes_saturates_instead_of_underflowing() {
+        // A pathologically long fingerprint must not panic on subtraction
+        // overflow; it just means no prefix fits at all.
+        assert_eq!(max_template_prefix_bytes(1000), 0);
+    }
+
+    #[test]
+    fn the_default_prefix_fits_comfortably() {
+        // `warmpool_tmpl_` is 14 bytes against a 38-byte budget. If this
+        // ever fails, the default itself has become unusable.
+        assert!(
+            "warmpool_tmpl_".len() <= max_template_prefix_bytes(16),
+            "the crate's own default prefix must fit its own budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_rejects_an_over_length_template_prefix() {
+        let limit = max_template_prefix_bytes(16);
+        let too_long = "p".repeat(limit + 1);
+
+        let result = TemplatePoolBuilder::new(dummy_connect_options())
+            .migrations_from("./tests/fixtures/migrations")
+            .template_prefix(too_long.clone())
+            .build()
+            .await;
+
+        // Match on the error side only: the Ok variant holds a
+        // TemplatePool, which deliberately isn't Debug.
+        let err = result
+            .err()
+            .expect("an over-length prefix must be rejected");
+        match err {
+            Error::TemplatePrefixTooLong {
+                prefix,
+                actual,
+                limit: reported,
+            } => {
+                assert_eq!(prefix, too_long);
+                assert_eq!(actual, too_long.len());
+                assert_eq!(reported, limit);
+            }
+            other => panic!("expected TemplatePrefixTooLong, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_accepts_a_prefix_exactly_at_the_limit() {
+        // The boundary itself must be allowed, an off-by-one here would
+        // reject a prefix that actually fits.
+        let at_limit = "p".repeat(max_template_prefix_bytes(16));
+
+        let pool = TemplatePoolBuilder::new(dummy_connect_options())
+            .migrations_from("./tests/fixtures/migrations")
+            .template_prefix(at_limit.clone())
+            .build()
+            .await
+            .expect("a prefix exactly at the limit must be accepted");
+
+        // And the name it produces must genuinely fit, suffix included,
+        // this is the property the limit exists to guarantee, checked
+        // rather than assumed.
+        let fp = fingerprint(&pool.migrations, None);
+        let building = format!("{at_limit}{fp}{BUILDING_SUFFIX}");
+        assert!(
+            building.len() <= PG_MAX_IDENTIFIER_BYTES,
+            "`{building}` is {} bytes, over the {PG_MAX_IDENTIFIER_BYTES}-byte limit",
+            building.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn prefix_budget_is_measured_in_bytes_not_chars() {
+        // Postgres truncates by byte. A prefix of multi-byte characters
+        // uses the budget up faster than its char count suggests, so a
+        // char-based check would wrongly accept this one.
+        let limit = max_template_prefix_bytes(16);
+        let multibyte = "é".repeat(limit); // 2 bytes each -> 2x over budget
+        assert!(
+            multibyte.chars().count() <= limit,
+            "char count is within budget"
+        );
+        assert!(multibyte.len() > limit, "but byte length is not");
+
+        let result = TemplatePoolBuilder::new(dummy_connect_options())
+            .migrations_from("./tests/fixtures/migrations")
+            .template_prefix(multibyte)
+            .build()
+            .await;
+
+        assert!(
+            matches!(
+                result.as_ref().err(),
+                Some(Error::TemplatePrefixTooLong { .. })
+            ),
+            "a multi-byte prefix over the byte budget must be rejected"
         );
     }
 

@@ -131,6 +131,7 @@ async fn creates_a_post(pool: sqlx::PgPool) {
 again. If your schema is unusually large or you're seeing WAL-related pressure (archiving, replication lag, disk usage) from a large template, benchmark both with the script `scripts/bench_clone_strategy.sh` and pick the one that works best for you.
 
 ### Stale template connection safety
+<<<<<<< HEAD
 
 `CREATE DATABASE ... TEMPLATE ...` requires that no connection remains open to the source template. In other words, a stray connection to the template database is enough to make cloning fail even when the template itself is otherwise valid. This was treated as a real bug and addressed in 0.1.2.
 
@@ -158,6 +159,101 @@ If you are unsure or do not trust the automatic pruning, the safer approach is t
 
 ## Important considerations
 
+=======
+
+`CREATE DATABASE ... TEMPLATE ...` requires that no connection remains open to the source template. In other words, a stray connection to the template database is enough to make cloning fail even when the template itself is otherwise valid. This was treated as a real bug and addressed in 0.1.2.
+
+As 0f 0.1.2+ warmpool runs a `pg_terminate_backend` sweep against the template's `datname` on the same maintenance connection already open in `create_test_database()`, immediately before the clone statement. Similar to the cleanup `TestDatabase::drop_database()` already performs for the database it owns. The sweep is shared via a `terminate_other_backends()` helper, but the call sites serve different purposes; one clears a database warmpool owns, the other clears the template it is about to clone from. 
+
+However, it does not prevent a brand new connection from racing in between the sweep finishing and the `CREATE DATABASE` statement executing. That residual window is accepted by design, and `Error::TemplateConnectionSweep` exists to make that failure mode explicit, warmpool cannot guarantee no new connection appears in that tiny race window.
+
+## Template lifecycle
+ 
+Templates are cheap to keep and are never auto invalidated. A template that isn't the current one for its migration set just becomes unreachable, not deleted. As of 0.1.6+ warmpool offers  two ways to reclaim that space. 
+
+### Manual cleanup (the default recommendation)
+ 
+```sql
+SELECT datname FROM pg_database
+WHERE left(datname, length('warmpool_tmpl_')) = 'warmpool_tmpl_';
+```
+ 
+```sql
+DROP DATABASE IF EXISTS warmpool_tmpl_<fingerprint>;
+```
+ 
+This is what we recommend if you're unsure whether the automatic option below is safe for your setup and environment, or if you'd simply rather look at the list before anything gets dropped. You get to see the names before you drop them, and you can check the timestamps in `pg_stat_database` to see which ones are actually stale.
+
+A `warmpool_tmpl_<fingerprint>_building` name found this way is almost always a genuine leftover from a build that crashed before finishing, and dropping it is exactly the right thing to do. However, if a build for that same migration set is actively running elsewhere
+right now, its `_building` database is legitimately in use, not stale.
+The automated option knows the difference but a one-off manual `DROP` does not, so if you're running this against a shared instance while other devs or CI jobs might be building, check
+first. If you see a `_building` name and you're unsure, leave it alone.
+
+### Automatic Opt-in pruning
+ 
+`TemplatePool` can drop its own stale siblings;
+ 
+```rust
+let template = warmpool::TemplatePool::builder(connect_options)
+    .migrations_from("./migrations")
+    .prune_stale_templates_on_build(true)
+    .build()
+    .await?;
+```
+ 
+With this enabled, the first time this `TemplatePool` builds or reuses its template, it also drops every other database sharing its template prefix once per `TemplatePool`, not once per clone.
+
+Before turning it on anywhere, see what it would actually delete:
+ 
+```rust
+let stale = template.stale_template_names().await?;
+println!("{stale:?}"); // nothing has been dropped yet
+ 
+let dropped = template.prune_stale_templates().await?; // now it has
+```
+
+This is a garbage collection kinda operation over a shared database namespace, not a normal part of template creation. It does not make sense as a destructive default because the default prefix `warmpool_tmpl_` is shared by by more than just the old templates:
+
+- **Multiple migration sets in one process** are an a supported
+  use of the builder API, two `TemplatePool`s, two different
+  `migrations_from(...)` directories, same default prefix, two different
+  fingerprints. Each one's template looks exactly like a stale leftover
+  from the other's point of view. With pruning on for both, they would
+  spend their time deleting each other's live templates.
+- **A shared dev Postgres instance or a shared CI instance**.The
+  fingerprint based naming and the advisory lock design in prticular assumes
+  unrelated projects might land on the same instance. The pruning logic doesn't
+  know "unrelated", it only knows "shares this prefix". Someone else's live
+  template, using the same default prefix, is indistinguishable from the stale one
+  you are targeting.
+
+If you turn this on, give the `TemplatePool` its own
+[`template_prefix`](#builder-api) first, so "shares this prefix" and "belongs to me" mean the same thing. Then you can safely prune stale templates on build without risking collateral damage to other projects. The default prefix is `warmpool_tmpl_`, so if you don't change it, you are sharing a namespace with every other warmpool user on the same Postgres instance.
+ 
+```rust
+let template = warmpool::TemplatePool::builder(connect_options)
+    .migrations_from("./migrations")
+    .template_prefix("myapp_tmpl_")
+    .prune_stale_templates_on_build(true)
+    .build()
+    .await?;
+```
+ 
+However, even with a unique prefix, the pruning logic is still careful about what it drops:
+
+- It never drops the template this pool is currently using.
+- It never drops a name ending in `_building` for that suffix belongs to
+  the crash atomic build logic and may be someone else's build in
+  progress right now, for a different fingerprint under the same prefix.
+- It matches by plain prefix equality, so lookalike names are never at risk.
+ 
+If you're not sure which option is right for you use manual cleanup.
+
+The macro is a convenience wrapper for the common case, one freshly built or cloned database per test function. A prune on build step is a cross test maintenance operation against a shared template prefix. If every test did this implicitly, different tests in the same run would race to delete templates another test may still be cloning from. The builder API is the right place for this behavior because it is explicit, pool scoped, and opt-in.
+
+## Important considerations
+
+>>>>>>> e185c05 (fixed identifier truncation bug that made _building collide with the template name)
 - Cleanup is explicit. Because Rust cannot run async code inside `Drop`, call `drop_database().await` yourself or use `#[warm_test]`.
 - `STRATEGY = WAL_LOG`/`FILE_COPY` pinning only applies on Postgres 15+; older servers are unaffected by the `clone_strategy` setting.
 - The advisory lock key is derived from the fingerprint, avoiding lock contention between unrelated projects sharing the same Postgres instance.

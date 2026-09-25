@@ -24,7 +24,11 @@ Four things determine where an item sits in the sequence below, roughly in this 
 | 3 | `purge_triggers_sql` doesn't escape the schema literal | **Resolved** | 0.1.4 | Bug fix |
 | 4 | `create_test_database_sql` doesn't escape the template prefix identifier | **Resolved** | 0.1.5 | Bug fix |
 | 5 | `exclude_migration`'s actual behavior may not be the behavior it appears to be, atleast for now | Open | pending | Design decision |
+<<<<<<< HEAD
 | 6 | Stale warmpool templates linger after migration churn and require manual cleanup | **Resolved** | 0.1.6 | UX |
+=======
+| 6 | Stale warmpool templates linger after migration churn and require manual cleanup | **Resolved** | 0.1.6 | DevX |
+>>>>>>> e185c05 (fixed identifier truncation bug that made _building collide with the template name)
 | 7 | Identifier truncation makes `_building` collide with the template name | Open | 0.1.7 | Bug fix |
 
 Five items **Resolved**. This table is the first thing that changes when something is.
@@ -53,6 +57,7 @@ link once it exists.
 
 ---
 
+<<<<<<< HEAD
 ### 7. Identifier truncation makes `_building` collide with the template name
  
 **Status:** Open · **Target:** 0.1.7 · **Severity:** breaks the first build outright; only reachable with a long `template_prefix` ·
@@ -93,6 +98,8 @@ truncating `template_prefix` ourselves so `_building` always fits; or droping th
  
 ---
 
+=======
+>>>>>>> e185c05 (fixed identifier truncation bug that made _building collide with the template name)
 ## Resolved
  
 ### 6. Stale warmpool templates linger after migration churn

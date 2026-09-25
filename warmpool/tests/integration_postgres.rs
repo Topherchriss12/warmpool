@@ -1498,3 +1498,81 @@ async fn test_pruning_does_not_happen_unless_explicitly_enabled() {
 
     let _ = pool_v2.prune_stale_templates().await;
 }
+
+/// An over long `template_prefix` used to fail in the
+/// most confusing way available. Postgres truncates identifiers to 63
+/// bytes with a `NOTICE`, not an error, so `<template>_building` could
+/// truncate back to exactly `<template>` making the crash atomic build
+/// path's final rename a rename to self that died with
+/// `database "..." already exists`. It then "self ealed" on the next
+/// call, so the symptom was an unexplained first call failure.
+///
+/// Now it's caught at `build()`, before any database work happens, with
+/// an error that names the actual budget.
+#[tokio::test]
+// #[ignore]
+async fn test_over_long_template_prefix_is_rejected_before_touching_the_database() {
+    let url = shared_postgres_url().await;
+    let connect_options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+
+    // 47 bytes: the exact shape that used to produce the collision
+    // (47 + 16-byte fingerprint = 63, so `_building` truncated away).
+    let prefix = "p".repeat(47);
+
+    let result = TemplatePool::builder(connect_options)
+        .migrations_from("./tests/fixtures/migrations")
+        .template_prefix(prefix)
+        .build()
+        .await;
+
+    let err = result
+        .err()
+        .expect("an over-length prefix must be rejected at build() time");
+    assert!(
+        matches!(err, warmpool::Error::TemplatePrefixTooLong { .. }),
+        "expected TemplatePrefixTooLong, got: {err}"
+    );
+}
+
+/// The boundary must be usable, not just safe: a prefix sized exactly to
+/// the budget has to build and clone normally.
+#[tokio::test]
+// #[ignore]
+async fn test_template_prefix_at_the_exact_limit_still_works_end_to_end() {
+    let url = shared_postgres_url().await;
+    let connect_options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+
+    // Keep it unique per run while staying exactly at the 38-byte budget.
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    let mut prefix = format!("wp_lim_{unique}_");
+    prefix.truncate(38);
+    assert_eq!(
+        prefix.len(),
+        38,
+        "test setup: prefix must sit exactly on the budget"
+    );
+
+    let template = TemplatePool::builder(connect_options)
+        .migrations_from("./tests/fixtures/migrations")
+        .template_prefix(prefix)
+        .build()
+        .await
+        .expect("a prefix exactly at the limit must be accepted");
+
+    // The part that actually used to break: the build's internal rename.
+    let db = template
+        .create_test_database()
+        .await
+        .expect("the build must complete -- no rename-to-self at the boundary");
+
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'users')",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("failed to query table existence");
+    assert!(exists, "the clone must be fully migrated");
+
+    db.drop_database().await.ok();
+    let _ = template.prune_stale_templates().await;
+}
