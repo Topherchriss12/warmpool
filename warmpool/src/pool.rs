@@ -1246,7 +1246,10 @@ mod tests {
     fn max_template_prefix_bytes_reserves_room_for_fingerprint_and_suffix() {
         // 63 - fingerprint - 9 ("_building") = budget
         let fp_len = crate::fingerprint::fingerprint(&Vec::new(), None).len();
-        assert_eq!(max_template_prefix_bytes(fp_len), 63 - fp_len - BUILDING_SUFFIX.len());
+        assert_eq!(
+            max_template_prefix_bytes(fp_len),
+            63 - fp_len - BUILDING_SUFFIX.len()
+        );
     }
 
     #[test]
