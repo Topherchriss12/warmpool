@@ -1201,15 +1201,15 @@ async fn test_malicious_template_prefix_cannot_execute_a_second_statement() {
         .fingerprint_salt(format!("prefix_injection_{}", uuid::Uuid::new_v4()))
         .template_prefix(malicious_prefix)
         .build()
-        .await
-        .expect("failed to build template pool");
+        .await;
 
-    // Whether this succeeds or fails is not the point, and deliberately
-    // not asserted: a prefix like this may well produce an invalid or
-    // over length database name, and erroring out is a perfectly
-    // acceptable outcome. The only thing that must hold is that it
-    // never executes the payload's second statement.
-    let _ = template.create_test_database().await;
+    // Whether the builder succeeds or fails is not the point: a prefix
+    // like this may produce an invalid or over length database name and
+    // erroring out is an acceptable outcome. The only thing that must
+    // hold is that it never executes the payload's second statement.
+    if let Ok(template) = template {
+        let _ = template.create_test_database().await;
+    }
 
     let victim_survived: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)")

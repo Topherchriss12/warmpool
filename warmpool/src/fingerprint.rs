@@ -26,7 +26,7 @@ pub fn fingerprint(migrations: &[Migration], salt: Option<&str>) -> String {
     hasher
         .finalize()
         .iter()
-        .take(8)
+        .take(6)
         .map(|b| format!("{b:02x}"))
         .collect()
 }

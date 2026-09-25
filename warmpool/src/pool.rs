@@ -1244,8 +1244,9 @@ mod tests {
 
     #[test]
     fn max_template_prefix_bytes_reserves_room_for_fingerprint_and_suffix() {
-        // 63 - 16 (fingerprint) - 9 ("_building") = 38
-        assert_eq!(max_template_prefix_bytes(16), 38);
+        // 63 - fingerprint - 9 ("_building") = budget
+        let fp_len = crate::fingerprint::fingerprint(&Vec::new(), None).len();
+        assert_eq!(max_template_prefix_bytes(fp_len), 63 - fp_len - BUILDING_SUFFIX.len());
     }
 
     #[test]
@@ -1257,17 +1258,18 @@ mod tests {
 
     #[test]
     fn the_default_prefix_fits_comfortably() {
-        // `warmpool_tmpl_` is 14 bytes against a 38-byte budget. If this
-        // ever fails, the default itself has become unusable.
+        // `warmpool_tmpl_` is 14 bytes against the computed budget.
+        let fp_len = crate::fingerprint::fingerprint(&Vec::new(), None).len();
         assert!(
-            "warmpool_tmpl_".len() <= max_template_prefix_bytes(16),
+            "warmpool_tmpl_".len() <= max_template_prefix_bytes(fp_len),
             "the crate's own default prefix must fit its own budget"
         );
     }
 
     #[tokio::test]
     async fn build_rejects_an_over_length_template_prefix() {
-        let limit = max_template_prefix_bytes(16);
+        let fp_len = crate::fingerprint::fingerprint(&Vec::new(), None).len();
+        let limit = max_template_prefix_bytes(fp_len);
         let too_long = "p".repeat(limit + 1);
 
         let result = TemplatePoolBuilder::new(dummy_connect_options())
@@ -1299,7 +1301,8 @@ mod tests {
     async fn build_accepts_a_prefix_exactly_at_the_limit() {
         // The boundary itself must be allowed, an off-by-one here would
         // reject a prefix that actually fits.
-        let at_limit = "p".repeat(max_template_prefix_bytes(16));
+        let fp_len = crate::fingerprint::fingerprint(&Vec::new(), None).len();
+        let at_limit = "p".repeat(max_template_prefix_bytes(fp_len));
 
         let pool = TemplatePoolBuilder::new(dummy_connect_options())
             .migrations_from("./tests/fixtures/migrations")
@@ -1325,7 +1328,8 @@ mod tests {
         // Postgres truncates by byte. A prefix of multi-byte characters
         // uses the budget up faster than its char count suggests, so a
         // char-based check would wrongly accept this one.
-        let limit = max_template_prefix_bytes(16);
+        let fp_len = crate::fingerprint::fingerprint(&Vec::new(), None).len();
+        let limit = max_template_prefix_bytes(fp_len);
         let multibyte = "é".repeat(limit); // 2 bytes each -> 2x over budget
         assert!(
             multibyte.chars().count() <= limit,
