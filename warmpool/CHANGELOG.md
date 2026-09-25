@@ -215,3 +215,34 @@ Names ending in `_building` are never pruned they may be an in-progress build fo
 ### Compatibility
 
 No breaking changes. This release adds a new builder option that does not exist on the macro. `warm_test` builds a fresh `TemplatePool` per test function; a per test prune would mean every test in a suite racing to delete templates that the *other tests in the same run* may be mid-clone from. The macro is not a good fit for this option, and the builder is the only place it exists. The macro continues to be a convenience wrapper around the builder, but it will not expose every option the builder supports.
+
+## 0.1.7
+
+### Fixed
+
+- Identifier truncation made `_building` collide with the template name. IN practise, An over long `template_prefix` is now rejected at `TemplatePoolBuilder::build()` with a typed `Error::TemplatePrefixTooLong`, before any database work happens.
+
+Postgres truncates identifiers to 63 bytes and emits a **`NOTICE`, not an error** which is silent. crash atomic logic we applied in 0.1.3 build path derives its in progress name as `format!("{template_name}_building")`. With a long enough prefix, `_building` was truncated away entirely and `building_name` became byte identical to `template_name`, so the build's final `ALTER DATABASE ... RENAME` became a rename to self and died with `database "..." already exists`.
+
+This failure *self-heals*. The `CREATE DATABASE` step had already left a fully migrated database under the final name, so the next call's existence check succeeded and returned normally. The observable symptom was an unexplained first call failure with a misleading error, followed by everything working. This about the hardest shape of bug to chase, and the fix is to reject the overlong prefix before any database work happens.
+
+Validation happens in `build()`, not in `template_prefix()`. The budget depends on the fingerprint length, which isn't known until the migration set has been loaded, so `template_prefix()` can't compute it. `build()` is still before any database work, so callers get a typed error immediately.
+
+The name that has to fit is not the template name, it's the `_building` name derived from it, which is the longest identifier warmpool ever constructs. The budget is therefore `63 - fingerprint_len - len("_building")`, which for the standard 16-character fingerprint is **38 bytes**.
+
+In practice, a 38-byte prefix produces `<38><16>_building` = exactly 63 bytes and provokes no truncation NOTICE; 39 bytes does truncate. The boundary is exact, and `build_template_prefix_at_the_exact_limit_still_works_end_to_end` exercises it through a real build and clone.
+
+The budget is measured in bytes. Postgres truncates by byte and the truncation is not encoding aware, so a byte truncated name can end mid character. A `char` based check would wrongly accept a prefix of multi-byte characters that is within the char budget but double it in bytes. `prefix_budget_is_measured_in_bytes_not_chars` pins this with a prefix of `é`.
+
+### Added
+
+- `Error::TemplatePrefixTooLong { prefix, actual, limit }`; reports the actual size and the usable budget, so the error is actionable.
+- `PG_MAX_IDENTIFIER_BYTES` and `BUILDING_SUFFIX` constants, plus `max_template_prefix_bytes()`. `PG_MAX_IDENTIFIER_BYTES` is `NAMEDATALEN - 1`, a server compile time constant not a runtime setting, so hard coding is safe and a server built with a larger `NAMEDATALEN` would only make this check conservative, never wrong.
+- unit tests, including both sides of the boundary, the saturating-subtraction case (a pathological fingerprint length must not panic on underflow), and a guard that the crate's *own* default prefix still fits its own budget.
+- Integration tests: the 47-byte prefix that used to produce the collision is now rejected, and a prefix sized exactly to the budget builds and clones end to end.
+
+### Compatibility
+
+a `template_prefix` longer than the budget now returns `Err` from `build()` where it previously returned `Ok` and failed confusingly later.
+
+No new dependencies. This release fixes a bug.
