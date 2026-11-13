@@ -2,13 +2,15 @@ use sha2::{Digest, Sha256};
 use sqlx::migrate::Migration;
 
 /// Hash the ordered (version, description, checksum) triples of every
-/// migration into a short hex fingerprint. Two invocations with identical
-/// migrations always produce the same fingerprint, and any change to a
-/// migration's SQL (which changes its checksum) produces a different one. This
-/// fingerprint is used to derive a deterministic template database name, which
-/// is what makes the template cache self invalidating: stale templates just
-/// never get a name collision with the new migration set, so they sit unused in
-/// Postgres until you clean them up (see the README's note on stale template cleanup).
+/// migration into a short hex fingerprint: the first 6 bytes of the SHA-256
+/// digest, rendered as 12 lowercase hex characters. Two invocations with
+/// identical migrations always produce the same fingerprint, and any change
+/// to a migration's SQL (which changes its checksum) produces a different
+/// one. This fingerprint is used to derive a deterministic template database
+/// name, which is what makes the template cache self invalidating: stale
+/// templates just never get a name collision with the new migration set, so
+/// they sit unused in Postgres until you clean them up (see the README's note
+/// on stale template cleanup).
 pub fn fingerprint(migrations: &[Migration], salt: Option<&str>) -> String {
     let mut hasher = Sha256::new();
     if let Some(salt) = salt {
@@ -58,6 +60,16 @@ mod tests {
         assert_eq!(
             fingerprint(&migrations, None),
             fingerprint(&migrations, None)
+        );
+    }
+
+    #[test]
+    fn fingerprint_is_twelve_lowercase_hex_characters() {
+        let fp = fingerprint(&Vec::new(), None);
+        assert_eq!(fp.len(), 12);
+        assert!(
+            fp.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+            "fingerprint must be lowercase hex: {fp}"
         );
     }
 

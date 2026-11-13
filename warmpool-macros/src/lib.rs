@@ -3,6 +3,7 @@
 //! re-exported from there.
 
 use proc_macro::TokenStream;
+use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
@@ -105,28 +106,33 @@ pub fn warm_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as WarmTestArgs);
     let input = parse_macro_input!(item as ItemFn);
 
+    match expand_warm_test(args, input) {
+        Ok(expanded) => expanded.into(),
+        Err(error) => error.to_compile_error().into(),
+    }
+}
+
+fn expand_warm_test(args: WarmTestArgs, input: ItemFn) -> syn::Result<TokenStream2> {
     let attrs = &input.attrs;
     let vis = &input.vis;
     let sig = &input.sig;
     let block = &input.block;
-    let fn_name = &sig.ident;
 
     if sig.asyncness.is_none() {
-        return syn::Error::new_spanned(sig, "#[warm_test] functions must be `async fn`")
-            .to_compile_error()
-            .into();
+        return Err(syn::Error::new_spanned(
+            sig,
+            "#[warm_test] functions must be `async fn`",
+        ));
     }
 
     let pool_ident = match sig.inputs.iter().collect::<Vec<_>>().as_slice() {
         [FnArg::Typed(pat_type)] => &pat_type.pat,
         _ => {
-            return syn::Error::new_spanned(
+            return Err(syn::Error::new_spanned(
                 &sig.inputs,
                 "#[warm_test] functions must take exactly one argument: \
                  `async fn my_test(pool: sqlx::PgPool)`",
-            )
-            .to_compile_error()
-            .into();
+            ));
         }
     };
 
@@ -154,10 +160,13 @@ pub fn warm_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     });
 
-    let expanded = quote! {
+    let mut generated_sig = sig.clone();
+    generated_sig.inputs.clear();
+
+    Ok(quote! {
         #(#attrs)*
         #[::tokio::test]
-        #vis async fn #fn_name() {
+        #vis #generated_sig {
             let __warmpool_database_url = ::std::env::var(#database_url_env)
                 .unwrap_or_else(|_| panic!(
                     "warmpool: environment variable `{}` is not set", #database_url_env
@@ -192,13 +201,12 @@ pub fn warm_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                 eprintln!("warmpool: failed to drop test database: {__warmpool_drop_err}");
             }
 
-            if let Err(__warmpool_panic) = __warmpool_result {
-                ::std::panic::resume_unwind(__warmpool_panic);
+            match __warmpool_result {
+                Ok(__warmpool_value) => __warmpool_value,
+                Err(__warmpool_panic) => ::std::panic::resume_unwind(__warmpool_panic),
             }
         }
-    };
-
-    expanded.into()
+    })
 }
 
 #[cfg(test)]
@@ -492,6 +500,34 @@ mod tests {
             "omitted clone_strategy must not synthesize a value \
              None is what makes warm_test() skip emitting .clone_strategy(...) \
              entirely and fall through to the builder's own default"
+        );
+    }
+
+    #[test]
+    fn generated_test_preserves_and_returns_the_original_result_type() {
+        let args: WarmTestArgs = syn::parse_str("").unwrap();
+        let input: ItemFn = syn::parse_quote! {
+            async fn my_test(pool: sqlx::PgPool) -> Result<(), &'static str> {
+                Ok(())
+            }
+        };
+
+        let expanded = expand_warm_test(args, input).unwrap();
+        let generated: ItemFn = syn::parse2(expanded).unwrap();
+
+        assert!(
+            generated.sig.inputs.is_empty(),
+            "generated test must take no arguments"
+        );
+
+        let tokens = quote!(#generated).to_string();
+        assert!(
+            tokens.contains("-> Result"),
+            "generated test dropped the original return type: {tokens}"
+        );
+        assert!(
+            tokens.contains("Ok (__warmpool_value) => __warmpool_value"),
+            "generated test discarded the body's value instead of returning it: {tokens}"
         );
     }
 }

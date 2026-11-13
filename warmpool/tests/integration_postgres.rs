@@ -714,7 +714,7 @@ async fn test_external_connection_during_a_build_does_not_disrupt_it_or_survive_
     let connect_options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
 
     let template = TemplatePool::builder(connect_options.clone())
-        .migrations_from("./tests/fixtures/migrations")
+        .migrations_from("./tests/fixtures/migrations_slow")
         .fingerprint_salt(salt.clone())
         .build()
         .await
@@ -723,21 +723,21 @@ async fn test_external_connection_during_a_build_does_not_disrupt_it_or_survive_
     // Reconstruct the template's name up front, before the template
     // exists, the same way the previous test does.
     let migrator =
-        sqlx::migrate::Migrator::new(std::path::Path::new("./tests/fixtures/migrations"))
+        sqlx::migrate::Migrator::new(std::path::Path::new("./tests/fixtures/migrations_slow"))
             .await
             .expect("failed to load migrations for fingerprint reconstruction");
     let migrations: Vec<_> = migrator.iter().cloned().collect();
     let fingerprint = warmpool::fingerprint(&migrations, Some(&salt));
     let template_name = format!("warmpool_tmpl_{fingerprint}");
+    let building_name = format!("{template_name}_building");
 
     // Race an external connection attempt against the first-ever build.
-    // The build creates the empty template database before it starts
-    // running migrations against it, so there's an actual window where the
-    // template exists but isn't finished yet, this task polls until it
-    // can connect, then holds the connection open across the rest of the
-    // build.
+    // The build creates the `_building` database before it starts running
+    // migrations against it, and the slow fixture holds that name open
+    // long enough to connect. This task polls the `_building` name, then
+    // holds the connection open across the rest of the build.
     let connect_options_for_observer = connect_options.clone();
-    let template_name_for_observer = template_name.clone();
+    let template_name_for_observer = building_name.clone();
     let observer = tokio::spawn(async move {
         loop {
             let opts = connect_options_for_observer
@@ -777,9 +777,9 @@ async fn test_external_connection_during_a_build_does_not_disrupt_it_or_survive_
         .expect("observer task timed out")
         .expect("observer task panicked");
 
-    // That lingering connection is still open right now. The *next*
-    // create_test_database() call's sweep must clean it up, exactly like
-    // it would for any other stray connection.
+    // That lingering connection is still open right now. The clone path's
+    // sweep must clean it up, exactly like it would for any other stray
+    // connection.
     let second = template.create_test_database().await.expect(
         "a lingering connection left over from during the build must not block a later clone",
     );
@@ -791,7 +791,7 @@ async fn test_external_connection_during_a_build_does_not_disrupt_it_or_survive_
     assert!(
         !backend_alive,
         "the observer's connection, opened during the build and left \
-         open, should have been terminated by the second \
+         open, should have been terminated by a \
          create_test_database() call's sweep"
     );
 
@@ -1184,8 +1184,11 @@ async fn test_malicious_template_prefix_cannot_execute_a_second_statement() {
     let url = shared_postgres_url().await;
     let connect_options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
 
-    // A bystander database the payload tries to destroy.
-    let victim = format!("wp_victim_{}", uuid::Uuid::new_v4().simple());
+    // A bystander database the payload tries to destroy. Keep the name
+    // short so the whole payload fits the template-prefix budget; an
+    // over-long prefix would be rejected before reaching the SQL layer,
+    // making this test vacuous.
+    let victim = format!("v{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
     let mut maintenance = sqlx::postgres::PgConnection::connect_with(&connect_options)
         .await
         .expect("failed to open maintenance connection");
@@ -1195,21 +1198,27 @@ async fn test_malicious_template_prefix_cannot_execute_a_second_statement() {
         .expect("test setup: failed to create the bystander database");
 
     let malicious_prefix = format!(r#"wp_evil_"; DROP DATABASE "{victim}"; --"#);
+    let budget = 63 - warmpool::fingerprint(&[], None).len() - "_building".len();
+    assert!(
+        malicious_prefix.len() <= budget,
+        "test setup: payload is {} bytes but the prefix budget is {budget}; \
+         an over-long payload would be rejected before reaching the SQL layer",
+        malicious_prefix.len()
+    );
 
     let template = TemplatePool::builder(connect_options.clone())
         .migrations_from("./tests/fixtures/migrations")
         .fingerprint_salt(format!("prefix_injection_{}", uuid::Uuid::new_v4()))
         .template_prefix(malicious_prefix)
         .build()
-        .await;
+        .await
+        .expect("a within-budget malicious prefix must reach the database layer");
 
-    // Whether the builder succeeds or fails is not the point: a prefix
-    // like this may produce an invalid or over length database name and
-    // erroring out is an acceptable outcome. The only thing that must
-    // hold is that it never executes the payload's second statement.
-    if let Ok(template) = template {
-        let _ = template.create_test_database().await;
-    }
+    let test_db = template
+        .create_test_database()
+        .await
+        .expect("the escaped malicious prefix must still produce a usable template");
+    test_db.drop_database().await.ok();
 
     let victim_survived: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)")
@@ -1504,20 +1513,23 @@ async fn test_pruning_does_not_happen_unless_explicitly_enabled() {
 /// bytes with a `NOTICE`, not an error, so `<template>_building` could
 /// truncate back to exactly `<template>` making the crash atomic build
 /// path's final rename a rename to self that died with
-/// `database "..." already exists`. It then "self ealed" on the next
+/// `database "..." already exists`. It then "self-healed" on the next
 /// call, so the symptom was an unexplained first call failure.
 ///
 /// Now it's caught at `build()`, before any database work happens, with
-/// an error that names the actual budget.
+/// an error that names the actual budget. With the current 12-character
+/// fingerprint, the budget is 42 bytes, so 43 is the first rejected size.
 #[tokio::test]
 // #[ignore]
 async fn test_over_long_template_prefix_is_rejected_before_touching_the_database() {
     let url = shared_postgres_url().await;
     let connect_options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
 
-    // 47 bytes: the exact shape that used to produce the collision
-    // (47 + 16-byte fingerprint = 63, so `_building` truncated away).
-    let prefix = "p".repeat(47);
+    // 43 bytes: one over the current 42-byte budget
+    // (63 - 12-byte fingerprint - 9-byte `_building`). Any prefix over
+    // this budget makes the `_building` name exceed Postgres's 63-byte
+    // identifier limit and get silently truncated.
+    let prefix = "p".repeat(43);
 
     let result = TemplatePool::builder(connect_options)
         .migrations_from("./tests/fixtures/migrations")
@@ -1535,20 +1547,23 @@ async fn test_over_long_template_prefix_is_rejected_before_touching_the_database
 }
 
 /// The boundary must be usable, not just safe: a prefix sized exactly to
-/// the budget has to build and clone normally.
+/// the budget (42 bytes for the current 12-character fingerprint) has to
+/// build and clone normally.
 #[tokio::test]
 // #[ignore]
 async fn test_template_prefix_at_the_exact_limit_still_works_end_to_end() {
     let url = shared_postgres_url().await;
     let connect_options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
 
-    // Keep it unique per run while staying exactly at the 38-byte budget.
+    // Keep it unique per run while staying exactly at the 42-byte budget
+    // (63 - 12-byte fingerprint - 9-byte `_building`).
     let unique = uuid::Uuid::new_v4().simple().to_string();
     let mut prefix = format!("wp_lim_{unique}_");
-    prefix.truncate(38);
+    let padding = 42 - prefix.len();
+    prefix.push_str(&"x".repeat(padding));
     assert_eq!(
         prefix.len(),
-        38,
+        42,
         "test setup: prefix must sit exactly on the budget"
     );
 
