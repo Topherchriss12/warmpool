@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- `#[warm_test]` now preserves the wrapped test function's return type and propagates its value. A test returning `Result::Err` previously reported `ok` because the result was discarded.
+
 ## 0.1.0
 
 - Initial release of warmpool.
@@ -228,9 +234,9 @@ This failure *self-heals*. The `CREATE DATABASE` step had already left a fully m
 
 Validation happens in `build()`, not in `template_prefix()`. The budget depends on the fingerprint length, which isn't known until the migration set has been loaded, so `template_prefix()` can't compute it. `build()` is still before any database work, so callers get a typed error immediately.
 
-The name that has to fit is not the template name, it's the `_building` name derived from it, which is the longest identifier warmpool ever constructs. The budget is therefore `63 - fingerprint_len - len("_building")`, which for the standard 16-character fingerprint is **38 bytes**.
+The name that has to fit is not the template name, it's the `_building` name derived from it, which is the longest identifier warmpool ever constructs. The budget is therefore `63 - fingerprint_len - len("_building")`, which for the standard 12-character fingerprint is **42 bytes**.
 
-In practice, a 38-byte prefix produces `<38><16>_building` = exactly 63 bytes and provokes no truncation NOTICE; 39 bytes does truncate. The boundary is exact, and `build_template_prefix_at_the_exact_limit_still_works_end_to_end` exercises it through a real build and clone.
+In practice, a 42-byte prefix produces `<42><12>_building` = exactly 63 bytes and provokes no truncation NOTICE; 43 bytes does truncate. The boundary is exact, and `test_template_prefix_at_the_exact_limit_still_works_end_to_end` exercises it through a real build and clone.
 
 The budget is measured in bytes. Postgres truncates by byte and the truncation is not encoding aware, so a byte truncated name can end mid character. A `char` based check would wrongly accept a prefix of multi-byte characters that is within the char budget but double it in bytes. `prefix_budget_is_measured_in_bytes_not_chars` pins this with a prefix of `é`.
 
@@ -239,7 +245,7 @@ The budget is measured in bytes. Postgres truncates by byte and the truncation i
 - `Error::TemplatePrefixTooLong { prefix, actual, limit }`; reports the actual size and the usable budget, so the error is actionable.
 - `PG_MAX_IDENTIFIER_BYTES` and `BUILDING_SUFFIX` constants, plus `max_template_prefix_bytes()`. `PG_MAX_IDENTIFIER_BYTES` is `NAMEDATALEN - 1`, a server compile time constant not a runtime setting, so hard coding is safe and a server built with a larger `NAMEDATALEN` would only make this check conservative, never wrong.
 - unit tests, including both sides of the boundary, the saturating-subtraction case (a pathological fingerprint length must not panic on underflow), and a guard that the crate's *own* default prefix still fits its own budget.
-- Integration tests: the 47-byte prefix that used to produce the collision is now rejected, and a prefix sized exactly to the budget builds and clones end to end.
+- Integration tests: an over-long prefix is now rejected, and a prefix sized exactly to the budget builds and clones end to end.
 
 ### Compatibility
 

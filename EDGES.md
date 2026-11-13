@@ -63,7 +63,7 @@ Postgres truncates identifiers to 63 bytes with a `NOTICE`, not an error. `build
  
 **The fix:** reject over long prefixes at `build()` with `Error::TemplatePrefixTooLong { prefix, actual, limit }`.
  
-The budget is `63 - fingerprint_len - len("_building")` — 38 bytes for the standard 16-character fingerprint, because the `_building` name, not the template name, is the longest identifier warmpool constructs. A 38 bytes produces exactly 63 and no truncation NOTICE; 39 truncates. Measured in **bytes**, since Postgres truncates by byte and not encoding aware, so a char based check would wrongly accept multi byte prefixes.
+The budget is `63 - fingerprint_len - len("_building")` — 42 bytes for the standard 12-character fingerprint, because the `_building` name, not the template name, is the longest identifier warmpool constructs. A 42-byte prefix produces exactly 63 and no truncation NOTICE; 43 bytes truncates. Measured in **bytes**, since Postgres truncates by byte and not encoding aware, so a char based check would wrongly accept multi byte prefixes.
  
 Validation lives in `build()` not `template_prefix()` because the budget depends on the fingerprint length, which isn't known until migrations are loaded, still before any database work, so the caller gets a typed error immediately.
 
