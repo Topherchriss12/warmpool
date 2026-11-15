@@ -5,6 +5,14 @@
 ### Fixed
 
 - `#[warm_test]` now preserves the wrapped test function's return type and propagates its value. A test returning `Result::Err` previously reported `ok` because the result was discarded.
+- `TemplatePoolBuilder::build()` now rejects an empty `template_prefix` with `Error::TemplatePrefixEmpty`. Previously an empty prefix was accepted, and stale-template pruning would match every database on the server that wasn't a Postgres template or a `_building` database.
+- Stale-template pruning now only considers databases named `<prefix><fingerprint>`: the current 12-character lowercase hex fingerprint, or the legacy 16-character fingerprint used before 0.1.7. A database that merely shares the prefix, such as `warmpool_tmpl_backup`, is no longer a prune candidate. `_building` databases and the current template remain excluded.
+- `TemplatePool::stale_template_names()` no longer builds the template or triggers automatic pruning, so a preview cannot drop the templates it is meant to list. `TemplatePool::prune_stale_templates()` also no longer builds the template or triggers automatic pruning, and returns only the names that call actually dropped.
+
+### Compatibility
+
+- `Error::TemplatePrefixEmpty` is a new variant on the `#[non_exhaustive]` error enum. An empty `template_prefix` now fails at `build()` instead of producing a pool that could prune unrelated databases.
+- `TemplatePool::stale_template_names()` and `prune_stale_templates()` no longer build the current template as a side effect. Code that relied on either call to create the template should call `create_test_database()` explicitly.
 
 ## 0.1.0
 
@@ -245,7 +253,7 @@ The budget is measured in bytes. Postgres truncates by byte and the truncation i
 - `Error::TemplatePrefixTooLong { prefix, actual, limit }`; reports the actual size and the usable budget, so the error is actionable.
 - `PG_MAX_IDENTIFIER_BYTES` and `BUILDING_SUFFIX` constants, plus `max_template_prefix_bytes()`. `PG_MAX_IDENTIFIER_BYTES` is `NAMEDATALEN - 1`, a server compile time constant not a runtime setting, so hard coding is safe and a server built with a larger `NAMEDATALEN` would only make this check conservative, never wrong.
 - unit tests, including both sides of the boundary, the saturating-subtraction case (a pathological fingerprint length must not panic on underflow), and a guard that the crate's *own* default prefix still fits its own budget.
-- Integration tests: an over-long prefix is now rejected, and a prefix sized exactly to the budget builds and clones end to end.
+- Integration tests: an over long prefix is now rejected, and a prefix sized exactly to the budget builds and clones end to end.
 
 ### Compatibility
 

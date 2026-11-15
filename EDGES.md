@@ -26,8 +26,10 @@ Four things determine where an item sits in the sequence below, roughly in this 
 | 5 | `exclude_migration`'s actual behavior may not be the behavior it appears to be, atleast for now | Open | pending | Design decision |
 | 6 | Stale warmpool templates linger after migration churn and require manual cleanup | **Resolved** | 0.1.6 | DevX |
 | 7 | Identifier truncation makes `_building` collide with the template name | **Resolved** | 0.1.7 | Bug fix |
+| 8 | An empty `template_prefix` made pruning match every database | **Resolved** | 0.1.9 | Bug fix |
+| 9 | `stale_template_names()` could trigger automatic pruning | **Resolved** | 0.1.9 | Bug fix |
 
-Six items **Resolved**. This table is the first thing that changes when something is.
+Eight items **Resolved**. This table is the first thing that changes when something is.
 
 ---
 
@@ -54,7 +56,31 @@ link once it exists.
 ---
 
 ## Resolved
- 
+
+### 9. `stale_template_names()` could trigger the automatic prune it was meant to preview
+
+**Resolved in:** 0.1.10
+
+`stale_template_names()` called `ensure_template()`, which runs the automatic prune when `prune_stale_templates_on_build(true)` is set. A caller trying to preview what would be dropped could instead cause it to be dropped, and a subsequent `prune_stale_templates()` could return an empty list because the automatic prune had already done the work.
+
+**The fix:** `stale_template_names()` and `prune_stale_templates()` compute the current template name from the migrations and salt directly instead of calling `ensure_template()`. The preview never builds or prunes, and the manual prune returns the names that call actually dropped.
+
+Covered by `test_stale_template_names_is_read_only_even_with_automatic_pruning_enabled`.
+
+**Tracking:** this entry will be linked to the PR that lands the fix.
+
+### 8. An empty `template_prefix` made pruning match every database
+
+**Resolved in:** 0.1.9
+
+`TemplatePoolBuilder::template_prefix("")` was accepted. `find_stale_templates()` matches with `left(datname, length($1)) = $1`, so an empty prefix matched every database on the server that wasn't a Postgres template or a `_building` database. `prune_stale_templates()` or `prune_stale_templates_on_build(true)` would then terminate connections to those databases and drop them. A non-empty prefix could also match ordinary databases that merely shared it, such as `warmpool_tmpl_backup`.
+
+**The fix:** `build()` rejects an empty prefix with `Error::TemplatePrefixEmpty`. Pruning now only considers names shaped like `<prefix><fingerprint>`: the suffix must be the current 12-character lowercase hex fingerprint or the legacy 16-character fingerprint used before 0.1.7. `_building` databases and the current template are still excluded. A prefix-sharing database that is not template-shaped is never a prune candidate.
+
+Covered by `build_rejects_an_empty_template_prefix`, the `template_name_shape_*` unit tests, and the integration test `test_prune_does_not_drop_databases_that_share_the_prefix_without_a_fingerprint_shape`.
+
+**Tracking:** this entry will be linked to the PR that lands the fix.
+
 ### 7. Identifier truncation makes `_building` collide with the template name
  
 **Resolved in:** 0.1.7
@@ -77,11 +103,11 @@ Validation lives in `build()` not `template_prefix()` because the budget depends
 
 Changing migrations changes the template fingerprint, which changes the template name. The new template is built alongside the old one under a different name, so there is no "drop before create" step to reclaim space. The real cost is accumulation: stale templates pile up on long-lived dev or CI instances, wasting disk space and cluttering the namespace.
 
-**The fix:** added cleanup helpers and a builder option to make the operation intentional. `TemplatePool::stale_template_names()` lists what pruning would remove without deleting anything; `TemplatePool::prune_stale_templates()` deletes the stale templates and returns the names it dropped; and `TemplatePoolBuilder::prune_stale_templates_on_build(bool)` runs the prune once per pool while the template is being built or reused, but defaults to `false`.
+**The fix:** added cleanup helpers and a builder option to make the operation intentional. `TemplatePool::stale_template_names()` lists the template-shaped candidates pruning would remove and does not build the template or trigger automatic pruning; a pool with automatic pruning enabled may already have pruned if it built or reused its template before the preview. `TemplatePool::prune_stale_templates()` deletes the stale templates and returns the names it dropped; and `TemplatePoolBuilder::prune_stale_templates_on_build(bool)` runs the prune once per pool while the template is being built or reused, but defaults to `false`.
 
-This is a lifecycle/housekeeping problem, not a correctness bug, so the default remains off. The name prefix is shared by sibling migration sets in the same process and by unrelated projects on a shared Postgres instance, and a destructive default would silently delete another pool's live template on every build. The implementation uses plain byte-prefix equality rather than `LIKE`, skips names ending in `_building`, and excludes template databases so the prune stays scoped to stale warmpool templates instead of other databases that merely resemble the prefix.
+This is a lifecycle/housekeeping problem, not a correctness bug, so the default remains off. The name prefix is shared by sibling migration sets in the same process and by unrelated projects on a shared Postgres instance, and a destructive default would silently delete another pool's live template on every build. The implementation uses plain prefix equality rather than `LIKE`, skips names ending in `_building`, excludes template databases, and only considers names shaped like `<prefix><fingerprint>` (with empty prefixes rejected at build time), so the prune stays scoped to stale warmpool templates instead of other databases that merely resemble the prefix.
 
-The option is fully opt-in, dry run friendly, and does not change the normal fast path for users who do not want automatic cleanup. It solves the stale template accumulation problem without forcing a destructive default onto shared environments.
+The option is fully opt-in and does not change the normal fast path for users who do not want automatic cleanup. It solves the stale template accumulation problem without forcing a destructive default onto shared environments.
 
 **[ISSUE#6](https://github.com/Topherchriss12/warmpool/issues/5#issue-5522247570)**
 

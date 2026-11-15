@@ -14,7 +14,7 @@ type ExcludeFn = Arc<dyn Fn(&Migration) -> bool + Send + Sync>;
 /// Postgres's identifier limit. Names longer than this are silently
 /// truncated (a `NOTICE`, not an error), which is what makes an
 /// over-long template prefix fail so confusingly -- see
-/// [`Error::TemplatePrefixTooLong`] and SHARP_EDGES.md #7.
+/// [`Error::TemplatePrefixTooLong`] and EDGES.md #7.
 ///
 /// This is `NAMEDATALEN - 1` and is a compile-time constant in the
 /// server, not a runtime setting, so it's safe to hard-code. A server
@@ -26,6 +26,11 @@ const PG_MAX_IDENTIFIER_BYTES: usize = 63;
 /// The `_building` name is the longest identifier warmpool constructs,
 /// so it -- not the template name itself -- is what has to fit.
 const BUILDING_SUFFIX: &str = "_building";
+
+/// The fingerprint length used by warmpool versions before 0.1.7.
+/// Templates created by those versions are still valid prune candidates
+/// after an upgrade.
+const LEGACY_FINGERPRINT_HEX_LEN: usize = 16;
 
 /// Longest prefix that still leaves room for the fingerprint and the
 /// `_building` suffix.
@@ -46,6 +51,7 @@ fn max_template_prefix_bytes(fingerprint_len: usize) -> usize {
 #[derive(Clone)]
 struct TemplateInfo {
     name: String,
+    fingerprint_len: usize,
     server_version_num: i32,
 }
 
@@ -124,6 +130,10 @@ impl TemplatePoolBuilder {
 
     /// Override the template database name prefix. Defaults to
     /// `warmpool_tmpl_`. The fingerprint hash is always appended.
+    ///
+    /// The prefix must not be empty: `build()` returns
+    /// [`Error::TemplatePrefixEmpty`] for an empty prefix, since an empty
+    /// prefix would make stale-template pruning match every database.
     pub fn template_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.template_prefix = prefix.into();
         self
@@ -136,9 +146,14 @@ impl TemplatePoolBuilder {
         self
     }
 
-    /// After this pool builds or reuses its template, drop every *other*
-    /// database sharing this pool's template prefix. Defaults to
-    /// `false`, and that default is deliberate.
+    /// After this pool builds or reuses its template, drop every other
+    /// *template-shaped* database sharing this pool's template prefix:
+    /// names of the form `<prefix><fingerprint>`. Defaults to `false`,
+    /// and that default is deliberate.
+    ///
+    /// A database that merely shares the prefix but is not shaped like
+    /// `<prefix><fingerprint>` (for example `warmpool_tmpl_backup`) is
+    /// never a prune candidate.
     ///
     /// When your migrations change, the fingerprint changes, so the new
     /// template gets a new *name* and is built alongside the old one --
@@ -147,8 +162,8 @@ impl TemplatePoolBuilder {
     /// reclaiming space and reducing clutter, not about unblocking a
     /// build.
     ///
-    /// Why it isn't the default: "every other database with this prefix"
-    /// is the only scoping available, and the default prefix
+    /// Why it isn't the default: prefix plus fingerprint shape is still
+    /// the only scoping available, and the default prefix
     /// (`warmpool_tmpl_`) is shared by everything using warmpool against
     /// a given Postgres instance. That includes sibling migration sets in
     /// the same process (see this type's own docs -- multiple migration
@@ -160,7 +175,8 @@ impl TemplatePoolBuilder {
     /// than one migration set, give each its own
     /// [`TemplatePoolBuilder::template_prefix`] first. To see what would
     /// be dropped without dropping anything, call
-    /// [`TemplatePool::stale_template_names`].
+    /// [`TemplatePool::stale_template_names`]; it does not build the
+    /// template or trigger automatic pruning.
     ///
     /// Databases whose names end in `_building` are never pruned: those
     /// belong to the crash-atomic build path and may be a build in
@@ -181,6 +197,10 @@ impl TemplatePoolBuilder {
     }
 
     pub async fn build(self) -> Result<TemplatePool> {
+        if self.template_prefix.is_empty() {
+            return Err(Error::TemplatePrefixEmpty);
+        }
+
         let migrations_path = self
             .migrations_path
             .clone()
@@ -202,13 +222,13 @@ impl TemplatePoolBuilder {
             .cloned()
             .collect();
 
-        // Validate the prefix here rather than in template_prefix():
-        // the budget depends on the fingerprint length, which isn't
-        // known until the migration set has been loaded. Failing at
-        // build() still means the caller finds out before any database
-        // work happens, and gets a typed error instead of a silent
-        // truncation they'd have to reverse-engineer from a
-        // rename-to-self failure much later. See SHARP_EDGES.md #7.
+        // Validate the length budget here rather than in template_prefix():
+        // it depends on the fingerprint length, which isn't known until the
+        // migration set has been loaded. Failing at build() still means the
+        // caller finds out before any database work happens, and gets a
+        // typed error instead of a silent truncation they'd have to
+        // reverse-engineer from a rename-to-self failure much later. See
+        // EDGES.md #7.
         let fingerprint_len = fingerprint(&migrations, self.fingerprint_salt.as_deref()).len();
         let limit = max_template_prefix_bytes(fingerprint_len);
         let actual = self.template_prefix.len();
@@ -332,6 +352,11 @@ impl TemplatePool {
         })
     }
 
+    fn template_name_and_fingerprint_len(&self) -> (String, usize) {
+        let fp = fingerprint(self.migrations.as_slice(), self.fingerprint_salt.as_deref());
+        (format!("{}{fp}", self.template_prefix), fp.len())
+    }
+
     async fn ensure_template(&self) -> Result<TemplateInfo> {
         let connect_options = self.connect_options.clone();
         let migrations = self.migrations.clone();
@@ -356,12 +381,17 @@ impl TemplatePool {
                     let mut conn = PgConnection::connect_with(&connect_options)
                         .await
                         .map_err(Error::MaintenanceConnect)?;
-                    prune_stale_templates_with(&mut conn, &prefix, &info.name)
-                        .await
-                        .map_err(|source| Error::PruneStaleTemplates {
-                            prefix: prefix.clone(),
-                            source,
-                        })?;
+                    prune_stale_templates_with(
+                        &mut conn,
+                        &prefix,
+                        &info.name,
+                        info.fingerprint_len,
+                    )
+                    .await
+                    .map_err(|source| Error::PruneStaleTemplates {
+                        prefix: prefix.clone(),
+                        source,
+                    })?;
                 }
 
                 Ok(info)
@@ -370,47 +400,69 @@ impl TemplatePool {
             .cloned()
     }
 
-    /// List the databases [`TemplatePool::prune_stale_templates`] would
-    /// drop, without dropping anything. Use this before enabling
-    /// pruning, especially on a Postgres instance shared with other
-    /// projects or other migration sets.
+    /// List the template-shaped databases
+    /// [`TemplatePool::prune_stale_templates`] would drop: names of the
+    /// form `<prefix><fingerprint>`, excluding the current template and
+    /// `_building` databases. Use this before enabling pruning,
+    /// especially on a Postgres instance shared with other projects or
+    /// other migration sets.
     /// [`TemplatePoolBuilder::prune_stale_templates_on_build`] documents why
     /// prefix scoping is weaker than it looks.
+    ///
+    /// This never builds the template and never triggers automatic
+    /// pruning, even when
+    /// [`TemplatePoolBuilder::prune_stale_templates_on_build`] is enabled.
     pub async fn stale_template_names(&self) -> Result<Vec<String>> {
-        let info = self.ensure_template().await?;
+        let (template_name, fingerprint_len) = self.template_name_and_fingerprint_len();
         let mut conn = PgConnection::connect_with(&self.connect_options)
             .await
             .map_err(Error::MaintenanceConnect)?;
 
-        find_stale_templates(&mut conn, &self.template_prefix, &info.name)
-            .await
-            .map_err(|source| Error::PruneStaleTemplates {
-                prefix: self.template_prefix.clone(),
-                source,
-            })
+        find_stale_templates(
+            &mut conn,
+            &self.template_prefix,
+            &template_name,
+            fingerprint_len,
+        )
+        .await
+        .map_err(|source| Error::PruneStaleTemplates {
+            prefix: self.template_prefix.clone(),
+            source,
+        })
     }
 
-    /// Drop every database sharing this pool's template prefix except the
-    /// one this pool is currently using, and except any `_building`
-    /// database (which may be an in-progress build for a different
-    /// fingerprint). Returns the names actually dropped.
+    /// Drop every stale template-shaped database sharing this pool's
+    /// prefix (names of the form `<prefix><fingerprint>`), except the one
+    /// this pool is currently using and any `_building` database (which
+    /// may be an in-progress build for a different fingerprint). Returns
+    /// the names actually dropped.
     ///
-    /// This is destructive and scoped only by prefix. Read
+    /// This is destructive and scoped only by prefix plus fingerprint
+    /// shape. Read
     /// [`TemplatePoolBuilder::prune_stale_templates_on_build`] before
     /// calling it, and consider
     /// [`TemplatePool::stale_template_names`] first.
+    ///
+    /// This does not build the current template. It returns only the
+    /// names this call actually dropped, even when automatic pruning is
+    /// enabled.
     pub async fn prune_stale_templates(&self) -> Result<Vec<String>> {
-        let info = self.ensure_template().await?;
+        let (template_name, fingerprint_len) = self.template_name_and_fingerprint_len();
         let mut conn = PgConnection::connect_with(&self.connect_options)
             .await
             .map_err(Error::MaintenanceConnect)?;
 
-        prune_stale_templates_with(&mut conn, &self.template_prefix, &info.name)
-            .await
-            .map_err(|source| Error::PruneStaleTemplates {
-                prefix: self.template_prefix.clone(),
-                source,
-            })
+        prune_stale_templates_with(
+            &mut conn,
+            &self.template_prefix,
+            &template_name,
+            fingerprint_len,
+        )
+        .await
+        .map_err(|source| Error::PruneStaleTemplates {
+            prefix: self.template_prefix.clone(),
+            source,
+        })
     }
 }
 
@@ -467,6 +519,7 @@ async fn build_or_reuse_template(
 
     Ok(TemplateInfo {
         name: template_name,
+        fingerprint_len: fp.len(),
         server_version_num,
     })
 }
@@ -661,7 +714,27 @@ async fn purge_triggers(conn: &mut PgConnection, schema: &str) -> Result<()> {
     Ok(())
 }
 
-/// Find databases sharing `prefix` that aren't `current_template`.
+/// Whether `name` is a template database name for `prefix`: exactly
+/// `<prefix><fingerprint>`, where the fingerprint is the current
+/// lowercase hex fingerprint or the legacy 16-character one. `_building`
+/// names and databases that merely share the prefix do not match.
+fn is_template_name(prefix: &str, name: &str, fingerprint_len: usize) -> bool {
+    if prefix.is_empty() {
+        return false;
+    }
+
+    let Some(suffix) = name.strip_prefix(prefix) else {
+        return false;
+    };
+
+    (suffix.len() == fingerprint_len || suffix.len() == LEGACY_FINGERPRINT_HEX_LEN)
+        && suffix
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Find stale template databases for `prefix` that aren't
+/// `current_template`.
 ///
 /// Matching uses `left(datname, length($1)) = $1` not
 /// `datname LIKE $1 || '%'` on purpose: `_` is a single character
@@ -669,17 +742,20 @@ async fn purge_triggers(conn: &mut PgConnection, schema: &str) -> Result<()> {
 /// them, so a `LIKE` form would also match names like `warmpool-tmplX...`
 /// that merely resemble the prefix.
 /// That difference matters for this is a *destructive* operation,
-/// so we uses plain prefix equality.
+/// so we use plain prefix equality.
 ///
-/// `_building` databases are skipped: they belong to the crash atomic
-/// build path and may be an in-progress build for another fingerprint.
-/// Postgres managed template databases (`datistemplate`) are skipped too,
-/// so a prefix that somehow matched `template0`/`template1` could never
-/// take them out.
+/// Prefix equality alone is too broad for a destructive operation, so
+/// candidates are additionally filtered by [`is_template_name`]: only
+/// `<prefix><fingerprint>` names are stale templates. `_building`
+/// databases are skipped: they belong to the crash atomic build path and
+/// may be an in-progress build for another fingerprint. Postgres managed
+/// template databases (`datistemplate`) are skipped too, so a prefix that
+/// somehow matched `template0`/`template1` could never take them out.
 async fn find_stale_templates(
     conn: &mut PgConnection,
     prefix: &str,
     current_template: &str,
+    fingerprint_len: usize,
 ) -> std::result::Result<Vec<String>, sqlx::Error> {
     let names: Vec<String> = sqlx::query_scalar(
         "SELECT datname \
@@ -695,15 +771,19 @@ async fn find_stale_templates(
     .fetch_all(conn)
     .await?;
 
-    Ok(names)
+    Ok(names
+        .into_iter()
+        .filter(|name| is_template_name(prefix, name, fingerprint_len))
+        .collect())
 }
 
 async fn prune_stale_templates_with(
     conn: &mut PgConnection,
     prefix: &str,
     current_template: &str,
+    fingerprint_len: usize,
 ) -> std::result::Result<Vec<String>, sqlx::Error> {
-    let stale = find_stale_templates(conn, prefix, current_template).await?;
+    let stale = find_stale_templates(conn, prefix, current_template, fingerprint_len).await?;
 
     let mut dropped = Vec::with_capacity(stale.len());
     for name in stale {
@@ -1269,6 +1349,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn template_name_shape_accepts_current_and_legacy_fingerprints() {
+        let prefix = "warmpool_tmpl_";
+        assert!(is_template_name(prefix, "warmpool_tmpl_0123456789ab", 12));
+        assert!(is_template_name(
+            prefix,
+            "warmpool_tmpl_0123456789abcdef",
+            12
+        ));
+    }
+
+    #[test]
+    fn template_name_shape_rejects_prefix_sharing_non_templates() {
+        let prefix = "warmpool_tmpl_";
+        for name in [
+            "warmpool_tmpl_backup",
+            "warmpool_tmpl_0123456789ab_extra",
+            "warmpool_tmpl_0123456789AB",
+            "warmpool_tmpl_0123456789ag",
+            "other_tmpl_0123456789ab",
+        ] {
+            assert!(
+                !is_template_name(prefix, name, 12),
+                "`{name}` must not be treated as a template"
+            );
+        }
+    }
+
+    #[test]
+    fn template_name_shape_rejects_building_names_and_empty_prefixes() {
+        assert!(!is_template_name(
+            "warmpool_tmpl_",
+            "warmpool_tmpl_0123456789ab_building",
+            12
+        ));
+        assert!(!is_template_name("", "0123456789ab", 12));
+    }
+
+    #[tokio::test]
+    async fn build_rejects_an_empty_template_prefix() {
+        let result = TemplatePoolBuilder::new(dummy_connect_options())
+            .migrations_from("./tests/fixtures/migrations")
+            .template_prefix("")
+            .build()
+            .await;
+
+        let err = result
+            .err()
+            .expect("an empty prefix must be rejected at build() time");
+        assert!(
+            matches!(err, Error::TemplatePrefixEmpty),
+            "expected TemplatePrefixEmpty, got {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn build_rejects_an_over_length_template_prefix() {
         let fp_len = crate::fingerprint::fingerprint(&Vec::new(), None).len();
@@ -1373,7 +1508,7 @@ mod tests {
         // The payload that, before this fix, actually executed as a
         // separate statement and dropped an unrelated database.
         //
-        // This is the key difference from SHARP_EDGES.md #3: that one's
+        // This is the key difference from EDGES.md #3: that one's
         // output lives inside a `DO $$ ... $$` body, which Postgres parses
         // as a single unit, so a break-out could only ever widen a WHERE
         // clause. These statements go out over simple query protocol,
