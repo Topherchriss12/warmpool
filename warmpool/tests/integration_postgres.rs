@@ -1163,6 +1163,147 @@ async fn test_purge_triggers_in_still_purges_exactly_the_named_schema() {
     db.drop_database().await.ok();
 }
 
+/// If `create_test_database()` fails after the clone has been created, it
+/// must drop that clone instead of leaking a `warmpool_test_*` database.
+///
+/// The failure is induced with an event trigger in the template that
+/// refuses to drop triggers, so the clone's trigger purge fails. The
+/// template also carries a marker table so a leaked clone can be found
+/// without relying on a database-name guess.
+#[tokio::test]
+// #[ignore]
+async fn test_create_test_database_cleans_up_clone_when_post_create_setup_fails() {
+    let url = shared_postgres_url().await;
+    let connect_options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+    let prefix = format!("wp_fail_{}_", uuid::Uuid::new_v4().simple());
+
+    let template_pool = TemplatePool::builder(connect_options.clone())
+        .migrations_from("./tests/fixtures/migrations")
+        .template_prefix(prefix.clone())
+        .build()
+        .await
+        .expect("failed to build template pool");
+    template_pool
+        .create_test_database()
+        .await
+        .expect("template build clone failed")
+        .drop_database()
+        .await
+        .ok();
+
+    let migrator =
+        sqlx::migrate::Migrator::new(std::path::Path::new("./tests/fixtures/migrations"))
+            .await
+            .expect("failed to load migrations");
+    let migrations: Vec<_> = migrator.iter().cloned().collect();
+    let template_name = format!("{prefix}{}", warmpool::fingerprint(&migrations, None));
+
+    let template_options = connect_options.clone().database(&template_name);
+    let mut template_conn = sqlx::postgres::PgConnection::connect_with(&template_options)
+        .await
+        .expect("failed to connect to the template");
+    template_conn
+        .execute("CREATE TABLE warmpool_leak_marker (id integer)")
+        .await
+        .expect("test setup: failed to create the leak marker table");
+    template_conn
+        .execute(
+            r#"
+            CREATE FUNCTION warmpool_reject_trigger_drop() RETURNS event_trigger AS $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM pg_event_trigger_dropped_objects()
+                    WHERE object_type = 'trigger'
+                ) THEN
+                    RAISE EXCEPTION 'warmpool test: refusing to drop triggers';
+                END IF;
+            END;
+            $$ LANGUAGE plpgsql
+            "#,
+        )
+        .await
+        .expect("test setup: failed to create the event trigger function");
+    template_conn
+        .execute(
+            r#"
+            CREATE EVENT TRIGGER warmpool_reject_trigger_drop
+                ON sql_drop
+                WHEN TAG IN ('DROP TRIGGER')
+                EXECUTE FUNCTION warmpool_reject_trigger_drop()
+            "#,
+        )
+        .await
+        .expect("test setup: failed to create the event trigger");
+    template_conn.close().await.ok();
+
+    let failing_pool = TemplatePool::builder(connect_options.clone())
+        .migrations_from("./tests/fixtures/migrations")
+        .template_prefix(prefix.clone())
+        .purge_triggers_in("tenant_a")
+        .build()
+        .await
+        .expect("failed to build failing pool");
+
+    let error = match failing_pool.create_test_database().await {
+        Ok(db) => {
+            let name = db.name().to_string();
+            db.drop_database().await.ok();
+            panic!("create_test_database unexpectedly succeeded for `{name}`");
+        }
+        Err(error) => error,
+    };
+
+    let mut maintenance = sqlx::postgres::PgConnection::connect_with(&connect_options)
+        .await
+        .expect("failed to open maintenance connection");
+    let candidates: Vec<String> = sqlx::query_scalar(
+        "SELECT datname \
+         FROM pg_database \
+         WHERE datname LIKE 'warmpool_test_%' \
+         ORDER BY datname",
+    )
+    .fetch_all(&mut maintenance)
+    .await
+    .expect("failed to query test databases");
+
+    let mut leaked = Vec::new();
+    for name in candidates {
+        let options = connect_options.clone().database(&name);
+        let Ok(mut conn) = sqlx::postgres::PgConnection::connect_with(&options).await else {
+            continue;
+        };
+        let has_marker: bool =
+            sqlx::query_scalar("SELECT to_regclass('public.warmpool_leak_marker') IS NOT NULL")
+                .fetch_one(&mut conn)
+                .await
+                .expect("failed to query the leak marker");
+        conn.close().await.ok();
+        if has_marker {
+            leaked.push(name);
+        }
+    }
+
+    for name in &leaked {
+        maintenance
+            .execute(format!(r#"DROP DATABASE IF EXISTS "{name}""#).as_str())
+            .await
+            .ok();
+    }
+    maintenance
+        .execute(format!(r#"DROP DATABASE IF EXISTS "{template_name}""#).as_str())
+        .await
+        .ok();
+
+    assert!(
+        matches!(error, warmpool::Error::PurgeTriggers { .. }),
+        "expected trigger purging to fail, got: {error}"
+    );
+    assert!(
+        leaked.is_empty(),
+        "a failed create_test_database() leaked cloned databases: {leaked:?}"
+    );
+}
+
 /// `template_prefix` fed into double quoted
 /// identifiers unescaped, so a prefix containing `"` could close the
 /// identifier, terminate the `CREATE DATABASE` statement, and start a new

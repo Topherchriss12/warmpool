@@ -239,7 +239,7 @@ The macro is a convenience wrapper for the common case, one freshly built or clo
 
 ## Important considerations
 
-- Cleanup is explicit. Because Rust cannot run async code inside `Drop`, call `drop_database().await` yourself or use `#[warm_test]`.
+- Cleanup is explicit. Because Rust cannot run async code inside `Drop`, call `drop_database().await` yourself or use `#[warm_test]`. If `create_test_database()` itself fails after creating the clone, warmpool drops that partial clone before returning the error.
 - `STRATEGY = WAL_LOG`/`FILE_COPY` pinning only applies on Postgres 15+; older servers are unaffected by the `clone_strategy` setting.
 - The advisory lock key is derived from the fingerprint, avoiding lock contention between unrelated projects sharing the same Postgres instance.
 

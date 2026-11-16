@@ -279,6 +279,9 @@ impl TemplatePool {
     /// return a connected pool plus a handle for explicit cleanup. Building
     /// the template (if it doesn't already exist) happens transparently on
     /// whichever call gets there first, guarded by a Postgres advisory lock.
+    ///
+    /// If setup fails after the clone has been created, the partial clone
+    /// is dropped before the error is returned.
     pub async fn create_test_database(&self) -> Result<TestDatabase> {
         let template_info = self.ensure_template().await?;
 
@@ -323,13 +326,23 @@ impl TemplatePool {
                 source,
             })?;
 
-        let connect_opts = self.connect_options.clone().database(&db_name);
+        let result = self.finish_test_database(&db_name).await;
+
+        if result.is_err() {
+            let _ = sweep_and_drop_database(&mut maintenance, &db_name).await;
+        }
+
+        result
+    }
+
+    async fn finish_test_database(&self, db_name: &str) -> Result<TestDatabase> {
+        let connect_opts = self.connect_options.clone().database(db_name);
 
         if !self.purge_schemas.is_empty() {
             let mut conn = PgConnection::connect_with(&connect_opts)
                 .await
                 .map_err(|source| Error::TestDbConnect {
-                    name: db_name.clone(),
+                    name: db_name.to_string(),
                     source,
                 })?;
             for schema in self.purge_schemas.iter() {
@@ -341,13 +354,13 @@ impl TemplatePool {
             PgPool::connect_with(connect_opts)
                 .await
                 .map_err(|source| Error::TestDbConnect {
-                    name: db_name.clone(),
+                    name: db_name.to_string(),
                     source,
                 })?;
 
         Ok(TestDatabase {
             pool,
-            name: db_name,
+            name: db_name.to_string(),
             maintenance_options: self.connect_options.clone(),
         })
     }
