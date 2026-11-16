@@ -1185,8 +1185,8 @@ async fn test_malicious_template_prefix_cannot_execute_a_second_statement() {
     let connect_options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
 
     // A bystander database the payload tries to destroy. Keep the name
-    // short so the whole payload fits the template-prefix budget; an
-    // over-long prefix would be rejected before reaching the SQL layer,
+    // short so the whole payload fits the template prefix budget; an
+    // over long prefix would be rejected before reaching the SQL layer,
     // making this test vacuous.
     let victim = format!("v{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
     let mut maintenance = sqlx::postgres::PgConnection::connect_with(&connect_options)
@@ -1458,6 +1458,92 @@ async fn test_prune_does_not_touch_databases_that_only_resemble_the_prefix() {
         .await;
 }
 
+/// Prefix equality alone is too broad for a destructive operation. A
+/// database can share the exact prefix without being a template, for
+/// example `warmpool_tmpl_backup`. Pruning must only consider names
+/// shaped like `<prefix><fingerprint>`, while still recognizing legacy
+/// 16-character fingerprints from older warmpool versions.
+#[tokio::test]
+// #[ignore]
+async fn test_prune_does_not_drop_databases_that_share_the_prefix_without_a_fingerprint_shape() {
+    let url = shared_postgres_url().await;
+    let connect_options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    let prefix = format!("wp_shape_{}_", &unique[..8]);
+    let backup = format!("{prefix}backup");
+    let legacy_template = format!("{prefix}0123456789abcdef");
+    let building = format!("{prefix}0123456789abcdef_building");
+
+    let mut maintenance = sqlx::postgres::PgConnection::connect_with(&connect_options)
+        .await
+        .expect("failed to open maintenance connection");
+    for name in [&backup, &legacy_template, &building] {
+        maintenance
+            .execute(format!(r#"CREATE DATABASE "{name}""#).as_str())
+            .await
+            .expect("test setup: failed to create database");
+    }
+
+    let pool = TemplatePool::builder(connect_options.clone())
+        .migrations_from("./tests/fixtures/migrations")
+        .template_prefix(prefix.clone())
+        .build()
+        .await
+        .expect("failed to build pool");
+    pool.create_test_database()
+        .await
+        .expect("clone failed")
+        .drop_database()
+        .await
+        .ok();
+
+    let dropped = pool
+        .prune_stale_templates()
+        .await
+        .expect("prune should succeed");
+    assert_eq!(
+        dropped,
+        vec![legacy_template.clone()],
+        "only the legacy fingerprint-shaped template should be dropped"
+    );
+
+    for (name, should_exist) in [
+        (&backup, true),
+        (&building, true),
+        (&legacy_template, false),
+    ] {
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)")
+                .bind(name)
+                .fetch_one(&mut maintenance)
+                .await
+                .unwrap();
+        assert_eq!(
+            exists, should_exist,
+            "database `{name}` existence should be {should_exist}"
+        );
+    }
+
+    for name in [&backup, &building] {
+        maintenance
+            .execute(format!(r#"DROP DATABASE IF EXISTS "{name}""#).as_str())
+            .await
+            .ok();
+    }
+
+    let migrator =
+        sqlx::migrate::Migrator::new(std::path::Path::new("./tests/fixtures/migrations"))
+            .await
+            .expect("failed to load migrations for template cleanup");
+    let migrations: Vec<_> = migrator.iter().cloned().collect();
+    let template_name = format!("{prefix}{}", warmpool::fingerprint(&migrations, None));
+    maintenance
+        .execute(format!(r#"DROP DATABASE IF EXISTS "{template_name}""#).as_str())
+        .await
+        .ok();
+}
+
 /// Pruning is off unless asked for. A pool built without
 /// `prune_stale_templates_on_build(true)` must leave other templates
 /// alone, because prefix scoping is shared with sibling migration sets
@@ -1506,6 +1592,134 @@ async fn test_pruning_does_not_happen_unless_explicitly_enabled() {
     );
 
     let _ = pool_v2.prune_stale_templates().await;
+}
+
+/// `stale_template_names()` must stay read-only even when automatic
+/// pruning is enabled: it should neither build the current template nor
+/// drop the stale templates it is previewing. `prune_stale_templates()`
+/// must then report the names it actually drops.
+#[tokio::test]
+// #[ignore]
+async fn test_stale_template_names_is_read_only_even_with_automatic_pruning_enabled() {
+    let url = shared_postgres_url().await;
+    let connect_options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+    let prefix = format!("wp_prev_{}_", uuid::Uuid::new_v4().simple());
+
+    let pool_v1 = TemplatePool::builder(connect_options.clone())
+        .migrations_from("./tests/fixtures/migrations")
+        .template_prefix(prefix.clone())
+        .build()
+        .await
+        .expect("failed to build pool v1");
+    pool_v1
+        .create_test_database()
+        .await
+        .expect("v1 clone failed")
+        .drop_database()
+        .await
+        .ok();
+
+    let v1_migrator =
+        sqlx::migrate::Migrator::new(std::path::Path::new("./tests/fixtures/migrations"))
+            .await
+            .expect("failed to load v1 migrations");
+    let v1_migrations: Vec<_> = v1_migrator.iter().cloned().collect();
+    let v1_template = format!("{prefix}{}", warmpool::fingerprint(&v1_migrations, None));
+
+    let v2_migrator =
+        sqlx::migrate::Migrator::new(std::path::Path::new("./tests/fixtures/migrations_v2"))
+            .await
+            .expect("failed to load v2 migrations");
+    let v2_migrations: Vec<_> = v2_migrator.iter().cloned().collect();
+    let v2_template = format!("{prefix}{}", warmpool::fingerprint(&v2_migrations, None));
+
+    let pool_v2 = TemplatePool::builder(connect_options.clone())
+        .migrations_from("./tests/fixtures/migrations_v2")
+        .template_prefix(prefix.clone())
+        .prune_stale_templates_on_build(true)
+        .build()
+        .await
+        .expect("failed to build pool v2");
+
+    let stale = pool_v2
+        .stale_template_names()
+        .await
+        .expect("preview should succeed");
+    assert_eq!(
+        stale,
+        vec![v1_template.clone()],
+        "preview must list v1's template without dropping it"
+    );
+
+    let mut maintenance = sqlx::postgres::PgConnection::connect_with(&connect_options)
+        .await
+        .expect("failed to open maintenance connection");
+
+    for (name, should_exist, why) in [
+        (
+            &v1_template,
+            true,
+            "the preview must not prune the stale template",
+        ),
+        (
+            &v2_template,
+            false,
+            "the preview must not build the current template",
+        ),
+    ] {
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)")
+                .bind(name)
+                .fetch_one(&mut maintenance)
+                .await
+                .unwrap();
+        assert_eq!(exists, should_exist, "{why}: {name}");
+    }
+
+    let dropped = pool_v2
+        .prune_stale_templates()
+        .await
+        .expect("manual prune should succeed");
+    assert_eq!(
+        dropped,
+        vec![v1_template.clone()],
+        "the manual prune must return the names it actually dropped"
+    );
+
+    let v1_still_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)")
+            .bind(&v1_template)
+            .fetch_one(&mut maintenance)
+            .await
+            .unwrap();
+    assert!(!v1_still_exists, "the manual prune must drop v1's template");
+}
+
+/// An empty `template_prefix` used to be accepted, and because pruning
+/// matches by prefix with `left(datname, length(prefix)) = prefix`, an
+/// empty prefix matched every database. `build()` must reject it before
+/// any database work happens.
+#[tokio::test]
+// #[ignore]
+async fn test_empty_template_prefix_is_rejected_before_touching_the_database() {
+    let connect_options: sqlx::postgres::PgConnectOptions =
+        "postgres://postgres:postgres@127.0.0.1:1/postgres"
+            .parse()
+            .unwrap();
+
+    let result = TemplatePool::builder(connect_options)
+        .migrations_from("./tests/fixtures/migrations")
+        .template_prefix("")
+        .build()
+        .await;
+
+    let err = result
+        .err()
+        .expect("an empty prefix must be rejected at build() time");
+    assert!(
+        matches!(err, warmpool::Error::TemplatePrefixEmpty),
+        "expected TemplatePrefixEmpty, got: {err}"
+    );
 }
 
 /// An over long `template_prefix` used to fail in the

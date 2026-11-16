@@ -142,6 +142,17 @@ pub enum Error {
         source: sqlx::Error,
     },
 
+    /// Fired from `TemplatePoolBuilder::build()` when `template_prefix`
+    /// is empty.
+    ///
+    /// An empty prefix makes the template name just the fingerprint, but
+    /// it also makes the prefix based stale template query match every
+    /// database on the server. Rejecting it at build time keeps pruning
+    /// from treating unrelated databases as stale templates. See
+    /// `EDGES.md` #8.
+    #[error("template prefix must not be empty")]
+    TemplatePrefixEmpty,
+
     /// Fired from `TemplatePoolBuilder::build()` when the template name
     /// this configuration would produce is too long for Postgres.
     ///
@@ -169,8 +180,8 @@ pub enum Error {
     },
 
     /// Fired while listing or dropping stale templates, either from
-    /// [`TemplatePool::stale_template_names`] /
-    /// [`TemplatePool::prune_stale_templates`] called directly, or from
+    /// [`crate::TemplatePool::stale_template_names`] /
+    /// [`crate::TemplatePool::prune_stale_templates`] called directly, or from
     /// the optional post build hook enabled by
     /// `TemplatePoolBuilder::prune_stale_templates_on_build`.
     ///
