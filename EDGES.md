@@ -28,8 +28,9 @@ Four things determine where an item sits in the sequence below, roughly in this 
 | 7 | Identifier truncation makes `_building` collide with the template name | **Resolved** | 0.1.7 | Bug fix |
 | 8 | An empty `template_prefix` made pruning match every database | **Resolved** | 0.1.9 | Bug fix |
 | 9 | `stale_template_names()` could trigger automatic pruning | **Resolved** | 0.1.9 | Bug fix |
+| 11 | The template's `_sqlx_migrations` table diverged from sqlx's canonical schema | **Resolved** | 0.1.11 | Bug fix |
 
-Eight items **Resolved**. This table is the first thing that changes when something is.
+Nine items **Resolved**. This table is the first thing that changes when something is.
 
 ---
 
@@ -56,6 +57,18 @@ link once it exists.
 ---
 
 ## Resolved
+
+### 11. The template's `_sqlx_migrations` table diverged from sqlx's canonical schema
+
+**Resolved in:** 0.1.11
+
+`run_migrations()` created `_sqlx_migrations` without sqlx's `installed_on` column and inserted `execution_time = 0` for every migration. sqlx itself only reads `version` and `checksum`, so migrations still worked, but tooling that selects `installed_on` failed and `execution_time` values were not real.
+
+**The fix:** the bootstrap table now matches sqlx's Postgres schema, including `installed_on TIMESTAMPTZ NOT NULL DEFAULT now()`. Successful migrations are inserted with `execution_time = -1` and then updated with the measured elapsed nanoseconds, matching sqlx's own insert/update sequence. Templates built by earlier versions keep the old shape until rebuilt; drop the old template or change the migration set to force a rebuild.
+
+Covered by `test_sqlx_migrations_table_matches_sqlx_canonical_schema`.
+
+**Tracking:** this entry will be linked to the PR that lands the fix.
 
 ### 9. `stale_template_names()` could trigger the automatic prune it was meant to preview
 
