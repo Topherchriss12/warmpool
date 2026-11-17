@@ -8,6 +8,7 @@
 - `TemplatePoolBuilder::build()` now rejects an empty `template_prefix` with `Error::TemplatePrefixEmpty`. Previously an empty prefix was accepted, and stale-template pruning would match every database on the server that wasn't a Postgres template or a `_building` database.
 - Stale-template pruning now only considers databases named `<prefix><fingerprint>`: the current 12-character lowercase hex fingerprint, or the legacy 16-character fingerprint used before 0.1.7. A database that merely shares the prefix, such as `warmpool_tmpl_backup`, is no longer a prune candidate. `_building` databases and the current template remain excluded.
 - `TemplatePool::stale_template_names()` no longer builds the template or triggers automatic pruning, so a preview cannot drop the templates it is meant to list. `TemplatePool::prune_stale_templates()` also no longer builds the template or triggers automatic pruning, and returns only the names that call actually dropped.
+- `TemplatePool::create_test_database()` now drops the cloned test database if a later setup step fails, including connecting to the clone, purging triggers, or opening its pool. Previously the clone was leaked and had to be cleaned up manually.
 - The template's `_sqlx_migrations` table now matches sqlx's canonical Postgres schema, including the `installed_on` column. Migration rows now record the measured `execution_time` instead of a hard-coded zero, so tooling that reads migration history sees the same shape and semantics it would from sqlx's own migrator.
 
 ### Compatibility

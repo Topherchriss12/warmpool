@@ -28,6 +28,7 @@ Four things determine where an item sits in the sequence below, roughly in this 
 | 7 | Identifier truncation makes `_building` collide with the template name | **Resolved** | 0.1.7 | Bug fix |
 | 8 | An empty `template_prefix` made pruning match every database | **Resolved** | 0.1.9 | Bug fix |
 | 9 | `stale_template_names()` could trigger automatic pruning | **Resolved** | 0.1.9 | Bug fix |
+| 10 | A failed post-create setup step leaked the cloned test database | **Resolved** | 0.1.10 | Bug fix |
 | 11 | The template's `_sqlx_migrations` table diverged from sqlx's canonical schema | **Resolved** | 0.1.11 | Bug fix |
 
 Nine items **Resolved**. This table is the first thing that changes when something is.
@@ -58,6 +59,15 @@ link once it exists.
 
 ## Resolved
 
+### 10. A failed post-create setup step leaked the cloned test database
+
+**Resolved in:** 0.1.10
+
+`create_test_database()` created the clone, then connected to it to purge triggers and opened the pool. If either step failed, the function returned the error but left the freshly created `warmpool_test_*` database behind. Repeated failures accumulated orphaned test databases.
+
+**The fix:** post-create setup is isolated in `finish_test_database()`. If it fails, `create_test_database()` sweeps and drops the partial clone before returning the original error. Cleanup is best effort so the setup error is not replaced.
+
+Covered by `test_create_test_database_cleans_up_clone_when_post_create_setup_fails`.
 ### 11. The template's `_sqlx_migrations` table diverged from sqlx's canonical schema
 
 **Resolved in:** 0.1.11
