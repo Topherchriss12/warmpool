@@ -27,6 +27,8 @@ warmpool splits the process into two simple phases:
 
 The template is named using a deterministic fingerprint derived from the ordered migration metadata and checksums. That means a change to your migrations automatically produces a new template name, so your tests stay aligned with the current schema without a manual rebuild step. Postgres handles the clone operation efficiently. Only the first test case to run pays the price, the rest become blazingly fast.
 
+Each template records applied migrations in a `_sqlx_migrations` table with the same schema as sqlx's migrator, including `installed_on`, so migration-history tooling can inspect templates and their clones directly.
+
 ## Two ways to use it
 
 ### Builder API

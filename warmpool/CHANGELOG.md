@@ -9,11 +9,13 @@
 - Stale-template pruning now only considers databases named `<prefix><fingerprint>`: the current 12-character lowercase hex fingerprint, or the legacy 16-character fingerprint used before 0.1.7. A database that merely shares the prefix, such as `warmpool_tmpl_backup`, is no longer a prune candidate. `_building` databases and the current template remain excluded.
 - `TemplatePool::stale_template_names()` no longer builds the template or triggers automatic pruning, so a preview cannot drop the templates it is meant to list. `TemplatePool::prune_stale_templates()` also no longer builds the template or triggers automatic pruning, and returns only the names that call actually dropped.
 - `TemplatePool::create_test_database()` now drops the cloned test database if a later setup step fails, including connecting to the clone, purging triggers, or opening its pool. Previously the clone was leaked and had to be cleaned up manually.
+- The template's `_sqlx_migrations` table now matches sqlx's canonical Postgres schema, including the `installed_on` column. Migration rows now record the measured `execution_time` instead of a hard-coded zero, so tooling that reads migration history sees the same shape and semantics it would from sqlx's own migrator.
 
 ### Compatibility
 
 - `Error::TemplatePrefixEmpty` is a new variant on the `#[non_exhaustive]` error enum. An empty `template_prefix` now fails at `build()` instead of producing a pool that could prune unrelated databases.
 - `TemplatePool::stale_template_names()` and `prune_stale_templates()` no longer build the current template as a side effect. Code that relied on either call to create the template should call `create_test_database()` explicitly.
+- Templates built by earlier versions keep their existing `_sqlx_migrations` table until they are rebuilt. Drop the old template or change the migration set to force a rebuild with the canonical schema.
 
 ## 0.1.0
 

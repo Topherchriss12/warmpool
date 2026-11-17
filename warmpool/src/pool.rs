@@ -6,6 +6,7 @@ use sqlx::postgres::PgConnectOptions;
 use sqlx::{Connection, Executor, PgConnection, PgPool};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
@@ -666,6 +667,7 @@ async fn run_migrations(
         CREATE TABLE IF NOT EXISTS _sqlx_migrations (
             version BIGINT PRIMARY KEY,
             description TEXT NOT NULL,
+            installed_on TIMESTAMPTZ NOT NULL DEFAULT now(),
             success BOOLEAN NOT NULL,
             checksum BYTEA NOT NULL,
             execution_time BIGINT NOT NULL
@@ -681,6 +683,8 @@ async fn run_migrations(
     })?;
 
     for migration in migrations {
+        let start = Instant::now();
+
         pool.execute(migration.sql.as_ref())
             .await
             .map_err(|source| Error::MigrationFailed {
@@ -694,13 +698,32 @@ async fn run_migrations(
             r#"
             INSERT INTO _sqlx_migrations
                 (version, description, success, checksum, execution_time)
-            VALUES ($1, $2, true, $3, 0)
-            ON CONFLICT (version) DO NOTHING
+            VALUES ($1, $2, TRUE, $3, -1)
             "#,
         )
         .bind(migration.version)
         .bind(migration.description.as_ref())
         .bind(migration.checksum.as_ref())
+        .execute(pool)
+        .await
+        .map_err(|source| Error::MigrationFailed {
+            version: migration.version,
+            description: migration.description.to_string(),
+            template: template_name.to_string(),
+            source,
+        })?;
+
+        let execution_time = i64::try_from(start.elapsed().as_nanos()).unwrap_or(i64::MAX);
+
+        sqlx::query(
+            r#"
+            UPDATE _sqlx_migrations
+            SET execution_time = $1
+            WHERE version = $2
+            "#,
+        )
+        .bind(execution_time)
+        .bind(migration.version)
         .execute(pool)
         .await
         .map_err(|source| Error::MigrationFailed {
