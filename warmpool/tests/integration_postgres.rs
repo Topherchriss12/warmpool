@@ -74,6 +74,40 @@ async fn test_creates_database_with_migrations() {
 }
 
 #[tokio::test]
+async fn test_sqlx_migrations_table_matches_sqlx_canonical_schema() {
+    let salt = format!("sqlx_migrations_schema_{}", uuid::Uuid::new_v4());
+    let url = shared_postgres_url().await;
+    let connect_options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+    let template = TemplatePool::builder(connect_options)
+        .migrations_from("./tests/fixtures/migrations")
+        .fingerprint_salt(salt)
+        .build()
+        .await
+        .expect("failed to build template pool");
+    let db = template
+        .create_test_database()
+        .await
+        .expect("failed to create test db");
+
+    let (installed_on, execution_time, success): (String, i64, bool) = sqlx::query_as(
+        "SELECT installed_on::text, execution_time, success \
+         FROM _sqlx_migrations ORDER BY version LIMIT 1",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("_sqlx_migrations should expose sqlx's installed_on column");
+
+    assert!(!installed_on.is_empty());
+    assert!(
+        execution_time > 0,
+        "execution_time should record elapsed nanoseconds, not the old hard-coded zero: {execution_time}"
+    );
+    assert!(success);
+
+    db.drop_database().await.expect("Cleanup should succeed");
+}
+
+#[tokio::test]
 // #[ignore]
 async fn test_template_cloning_is_fast() {
     let salt = format!("cloning_is_fast_{}", uuid::Uuid::new_v4());
