@@ -11,6 +11,12 @@
 - `TemplatePool::create_test_database()` now drops the cloned test database if a later setup step fails, including connecting to the clone, purging triggers, or opening its pool. Previously the clone was leaked and had to be cleaned up manually.
 - The template's `_sqlx_migrations` table now matches sqlx's canonical Postgres schema, including the `installed_on` column. Migration rows now record the measured `execution_time` instead of a hard-coded zero, so tooling that reads migration history sees the same shape and semantics it would from sqlx's own migrator.
 
+### Internal
+
+- CI runs tests and coverage with `--all-features`, so the optional `macros` feature is exercised. A new integration test runs `#[warm_test]` with both `Ok` and `Err` `Result` returns in a subprocess, covering the re-export and return-value propagation end to end.
+- The template reuse integration test now proves reuse by comparing the template's `pg_database` OID before and after the second pool's first clone. Wall-clock speedups are reported as warnings instead of assertions, so load related timing variance cannot fail the test.
+- `find_stale_templates()` now binds `BUILDING_SUFFIX` and derives its length in SQL instead of hardcoding `9`, so the stale-template query stays correct if the suffix changes.
+
 ### Compatibility
 
 - `Error::TemplatePrefixEmpty` is a new variant on the `#[non_exhaustive]` error enum. An empty `template_prefix` now fails at `build()` instead of producing a pool that could prune unrelated databases.

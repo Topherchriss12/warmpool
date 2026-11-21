@@ -798,12 +798,13 @@ async fn find_stale_templates(
          FROM pg_database \
          WHERE left(datname, length($1)) = $1 \
            AND datname <> $2 \
-           AND right(datname, 9) <> '_building' \
+           AND right(datname, length($3)) <> $3 \
            AND NOT datistemplate \
          ORDER BY datname",
     )
     .bind(prefix)
     .bind(current_template)
+    .bind(BUILDING_SUFFIX)
     .fetch_all(conn)
     .await?;
 

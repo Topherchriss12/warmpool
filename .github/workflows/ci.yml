@@ -31,10 +31,10 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
       
       - name: Generate code coverage
-        run: cargo llvm-cov --lcov --output-path lcov.info
+        run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info
       
       - name: Run unit, integration, and Postgres tests
-        run: cargo test --workspace
+        run: cargo test --workspace --all-features
       
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5

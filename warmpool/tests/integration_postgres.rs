@@ -126,6 +126,12 @@ async fn test_template_cloning_is_fast() {
         .await
         .expect("failed to create test db");
     let first_duration = start_first.elapsed();
+    let first_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'users')",
+    )
+    .fetch_one(db1.pool())
+    .await
+    .expect("failed to query the first clone");
     db1.drop_database().await.ok();
 
     let start_second = Instant::now();
@@ -134,12 +140,30 @@ async fn test_template_cloning_is_fast() {
         .await
         .expect("failed to create test db");
     let second_duration = start_second.elapsed();
+    let second_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'users')",
+    )
+    .fetch_one(db2.pool())
+    .await
+    .expect("failed to query the second clone");
     db2.drop_database().await.ok();
 
     assert!(
-        second_duration < first_duration,
-        "Second run ({second_duration:?}) should be faster than first run ({first_duration:?})"
+        first_exists,
+        "the first clone must have the migrated schema"
     );
+    assert!(
+        second_exists,
+        "the second clone must have the migrated schema"
+    );
+
+    if second_duration >= first_duration {
+        eprintln!(
+            "Warning: the second clone ({second_duration:?}) was not faster than \
+             the first ({first_duration:?}); this can happen under load and is not \
+             a correctness failure"
+        );
+    }
 }
 
 #[tokio::test]
@@ -566,11 +590,32 @@ async fn test_template_is_reused_across_separate_template_pool_instances() {
     let elapsed_a = start_a.elapsed();
     db_a.drop_database().await.ok();
 
+    // Reconstruct the template name and capture its OID. If pool_b reuses
+    // the template, the OID must be unchanged after pool_b's first clone.
+    let migrator =
+        sqlx::migrate::Migrator::new(std::path::Path::new("./tests/fixtures/migrations"))
+            .await
+            .expect("failed to load migrations for template reuse check");
+    let migrations: Vec<_> = migrator.iter().cloned().collect();
+    let template_name = format!(
+        "warmpool_tmpl_{}",
+        warmpool::fingerprint(&migrations, Some(&salt))
+    );
+
+    let mut maintenance = sqlx::PgConnection::connect_with(&connect_options)
+        .await
+        .expect("failed to connect to postgres for template reuse check");
+    let template_oid_before: i64 =
+        sqlx::query_scalar("SELECT oid::bigint FROM pg_database WHERE datname = $1")
+            .bind(&template_name)
+            .fetch_one(&mut maintenance)
+            .await
+            .expect("pool_a should have created the template");
+
     // Second, independent TemplatePool, same migrations + salt -> same
-    // fingerprint -> same template name. Its very first clone should not
-    // need to rebuild the template (no migrations to rerun), and should be
-    // fast in the same way every clone after the first one from pool_a was.
-    let pool_b = TemplatePool::builder(connect_options)
+    // fingerprint -> same template name. Its very first clone should reuse
+    // the existing template rather than rebuilding it.
+    let pool_b = TemplatePool::builder(connect_options.clone())
         .migrations_from("./tests/fixtures/migrations")
         .fingerprint_salt(salt)
         .build()
@@ -592,34 +637,29 @@ async fn test_template_is_reused_across_separate_template_pool_instances() {
     .unwrap();
     assert!(exists, "pool_b's clone must have the migrated schema");
 
-    // pool_b should be faster or at least not slower since it's cloning an
-    // existing template and not building it from scratch.
-    //
-    // We expect at least a 3x speedup in a healthy environment, but this test
-    // is inherently non-deterministic due to factors like disk I/O, Docker
-    // overhead, and system load. The critical assertion is that pool_b is not
-    // slower than pool_a - if it is, the template is definitely not being reused.
+    let template_oid_after: i64 =
+        sqlx::query_scalar("SELECT oid::bigint FROM pg_database WHERE datname = $1")
+            .bind(&template_name)
+            .fetch_one(&mut maintenance)
+            .await
+            .expect("the template should still exist after pool_b's clone");
+    assert_eq!(
+        template_oid_before, template_oid_after,
+        "pool_b rebuilt the template instead of reusing the one pool_a created"
+    );
+
+    // Timing is informational only: CI load and disk I/O make strict speedup
+    // assertions flaky, while the OID check above deterministically proves reuse.
     let speedup = elapsed_a.as_secs_f64() / elapsed.as_secs_f64();
 
     if speedup < 3.0 {
         eprintln!(
             "Warning: template reuse speedup is only {:.2}x (expected >= 3x). \
-             This may indicate a slow or overloaded test environment, but the \
-             template is still being reused since pool_b ({elapsed:?}) is faster \
-             than pool_a ({elapsed_a:?}).",
+             This may indicate a slow or overloaded test environment, but template \
+             reuse is verified by the pg_database OID check.",
             speedup
         );
     }
-
-    // The test only fails if pool_b is slower than pool_a, which would mean
-    // the template is not being reused at all, that's a critical bug.
-    // A speedup < 3x is just a warning, not a failure.
-    assert!(
-        elapsed <= elapsed_a,
-        "pool_b's first clone ({elapsed:?}) was slower than pool_a's first clone \
-         ({elapsed_a:?}). This indicates the template is not being reused \
-         between separate TemplatePool instances, which is a critical bug."
-    );
 
     db_b.drop_database().await.ok();
 }
@@ -1979,4 +2019,66 @@ async fn test_template_prefix_at_the_exact_limit_still_works_end_to_end() {
 
     db.drop_database().await.ok();
     let _ = template.prune_stale_templates().await;
+}
+
+#[cfg(feature = "macros")]
+mod macro_result {
+    use super::shared_postgres_url;
+
+    #[warmpool::warm_test(
+        migrations = "./tests/fixtures/migrations",
+        database_url_env = "WARMPOOL_MACRO_RESULT_DATABASE_URL"
+    )]
+    #[ignore = "run by test_warm_test_macro_preserves_result_return"]
+    async fn warm_test_result_ok(pool: sqlx::PgPool) -> Result<(), sqlx::Error> {
+        let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(&pool)
+            .await?;
+        assert!(users >= 0);
+        Ok(())
+    }
+
+    #[warmpool::warm_test(
+        migrations = "./tests/fixtures/migrations",
+        database_url_env = "WARMPOOL_MACRO_RESULT_DATABASE_URL"
+    )]
+    #[ignore = "run by test_warm_test_macro_preserves_result_return"]
+    async fn warm_test_result_err(pool: sqlx::PgPool) -> Result<(), sqlx::Error> {
+        let _ = pool;
+        Err(sqlx::Error::RowNotFound)
+    }
+
+    fn run_macro_test(name: &str, database_url: &str) -> std::process::Output {
+        std::process::Command::new(std::env::current_exe().expect("test binary path"))
+            .args(["--ignored", "--exact", name])
+            .env("WARMPOOL_MACRO_RESULT_DATABASE_URL", database_url)
+            .output()
+            .expect("failed to run the macro test subprocess")
+    }
+
+    #[tokio::test]
+    async fn test_warm_test_macro_preserves_result_return() {
+        let database_url = shared_postgres_url().await;
+
+        let ok_output = run_macro_test("macro_result::warm_test_result_ok", database_url);
+        assert!(
+            ok_output.status.success(),
+            "a #[warm_test] returning Ok should pass:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&ok_output.stdout),
+            String::from_utf8_lossy(&ok_output.stderr),
+        );
+
+        let err_output = run_macro_test("macro_result::warm_test_result_err", database_url);
+        let err_stdout = String::from_utf8_lossy(&err_output.stdout);
+        let err_stderr = String::from_utf8_lossy(&err_output.stderr);
+        let err_output_text = format!("{err_stdout}\n{err_stderr}");
+        assert!(
+            !err_output.status.success(),
+            "a #[warm_test] returning Err must fail the test:\n{err_output_text}"
+        );
+        assert!(
+            err_output_text.contains("RowNotFound"),
+            "the subprocess should fail because of the returned Err, not a setup error:\n{err_output_text}"
+        );
+    }
 }
